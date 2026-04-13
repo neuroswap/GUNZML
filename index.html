@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GunzML — Fast-Paced 3D Shooter</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;500;600;700&family=Share+Tech+Mono&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <!-- ═══════════════════════ GAME CANVAS ═══════════════════════ -->
+  <canvas id="gameCanvas"></canvas>
+
+  <!-- ═══════════════════════ LOADING SCREEN ═══════════════════════ -->
+  <div id="loadingScreen">
+    <div class="load-logo">GUNZML</div>
+    <div class="load-bar-wrap"><div id="loadBar" class="load-bar"></div></div>
+    <div class="load-status" id="loadStatus">Initializing engine...</div>
+  </div>
+
+  <!-- ═══════════════════════ MAIN MENU ═══════════════════════ -->
+  <div id="mainMenu" class="screen">
+    <div class="menu-bg-grid"></div>
+    <div class="menu-content">
+      <div class="menu-logo">
+        <span class="logo-gun">GUNZ</span><span class="logo-ml">ML</span>
+      </div>
+      <p class="menu-tagline">Build. Shoot. Dominate.</p>
+
+      <div class="menu-name-row">
+        <label for="playerNameInput">CALLSIGN</label>
+        <input id="playerNameInput" type="text" maxlength="20" placeholder="Enter callsign..." spellcheck="false" />
+      </div>
+
+      <div class="menu-buttons">
+        <button class="btn-primary" id="btnPlay">▶ PLAY SOLO</button>
+        <button class="btn-secondary" id="btnMultiplayer">⚡ JOIN ONLINE</button>
+        <button class="btn-secondary" id="btnControls">⌨ CONTROLS</button>
+      </div>
+
+      <div class="menu-footer">v0.1.0 &nbsp;|&nbsp; GunzML &nbsp;|&nbsp; Open Source</div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════ CONTROLS SCREEN ═══════════════════════ -->
+  <div id="controlsScreen" class="screen hidden">
+    <div class="panel">
+      <h2>CONTROLS</h2>
+      <div class="controls-grid">
+        <span>WASD</span><span>Move</span>
+        <span>SPACE</span><span>Jump</span>
+        <span>SHIFT</span><span>Sprint</span>
+        <span>LEFT CLICK</span><span>Shoot</span>
+        <span>RIGHT CLICK</span><span>Aim</span>
+        <span>B</span><span>Toggle Build Mode</span>
+        <span>1</span><span>Build: Wall</span>
+        <span>2</span><span>Build: Floor</span>
+        <span>3</span><span>Build: Ramp</span>
+        <span>F / LMB</span><span>Place Structure</span>
+        <span>R</span><span>Reload</span>
+        <span>ESC</span><span>Pause / Unlock Mouse</span>
+        <span>SHIFT + `</span><span>[ADMIN] Console</span>
+      </div>
+      <button class="btn-secondary" id="btnBackControls">← BACK</button>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════ PAUSE MENU ═══════════════════════ -->
+  <div id="pauseMenu" class="screen hidden">
+    <div class="panel">
+      <h2>PAUSED</h2>
+      <button class="btn-primary" id="btnResume">▶ RESUME</button>
+      <button class="btn-secondary" id="btnQuit">⏹ QUIT TO MENU</button>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════ HUD ═══════════════════════ -->
+  <div id="hud" class="hidden">
+
+    <!-- Crosshair -->
+    <div id="crosshair">
+      <div class="ch-top"></div>
+      <div class="ch-bottom"></div>
+      <div class="ch-left"></div>
+      <div class="ch-right"></div>
+      <div class="ch-dot"></div>
+    </div>
+
+    <!-- Hit marker (flash on hit) -->
+    <div id="hitMarker" class="hidden">✕</div>
+
+    <!-- Health Bar -->
+    <div id="healthBar">
+      <div class="hud-label">HP</div>
+      <div class="bar-track">
+        <div id="healthFill" class="bar-fill health"></div>
+      </div>
+      <div id="healthVal" class="hud-val">100</div>
+    </div>
+
+    <!-- Ammo -->
+    <div id="ammoDisplay">
+      <span id="ammoCount">30</span>
+      <span class="ammo-sep">/</span>
+      <span id="ammoReserve">90</span>
+      <div class="ammo-label">AMMO</div>
+    </div>
+
+    <!-- Kill Feed -->
+    <div id="killFeed"></div>
+
+    <!-- Score -->
+    <div id="scoreDisplay">
+      <div class="score-item">KILLS <span id="killCount">0</span></div>
+    </div>
+
+    <!-- Build Mode Banner -->
+    <div id="buildBanner" class="hidden">
+      <span id="buildModeLabel">BUILD MODE</span>
+      <div id="buildTypeRow">
+        <span class="btype" id="bt1" data-type="wall">1·WALL</span>
+        <span class="btype" id="bt2" data-type="floor">2·FLOOR</span>
+        <span class="btype" id="bt3" data-type="ramp">3·RAMP</span>
+      </div>
+    </div>
+
+    <!-- Reload indicator -->
+    <div id="reloadBar" class="hidden">
+      <div class="reload-text">RELOADING...</div>
+      <div class="bar-track"><div id="reloadFill" class="bar-fill reload"></div></div>
+    </div>
+
+    <!-- Network status -->
+    <div id="netStatus" class="net-offline">● OFFLINE</div>
+
+    <!-- Player list (TAB) -->
+    <div id="playerList" class="hidden">
+      <div class="pl-title">PLAYERS</div>
+      <ul id="plList"></ul>
+    </div>
+
+    <!-- Report button -->
+    <button id="btnReport" class="btn-report" title="Report a player">⚑ REPORT</button>
+
+  </div><!-- end #hud -->
+
+  <!-- ═══════════════════════ DEATH SCREEN ═══════════════════════ -->
+  <div id="deathScreen" class="screen hidden">
+    <div class="panel panel-death">
+      <h2 class="death-title">YOU DIED</h2>
+      <p id="deathMsg" class="death-msg">Eliminated by an enemy.</p>
+      <button class="btn-primary" id="btnRespawn">↺ RESPAWN</button>
+      <button class="btn-secondary" id="btnDeathQuit">⏹ QUIT</button>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════ REPORT MODAL ═══════════════════════ -->
+  <div id="reportModal" class="modal-backdrop hidden">
+    <div class="modal">
+      <h3>REPORT PLAYER</h3>
+      <label>Select Player</label>
+      <select id="reportTarget">
+        <option value="">-- Choose player --</option>
+      </select>
+      <label>Reason</label>
+      <select id="reportReason">
+        <option value="cheating">Cheating / Hacking</option>
+        <option value="aimbot">Aimbot Suspected</option>
+        <option value="harassment">Harassment</option>
+        <option value="glitching">Exploiting Glitches</option>
+        <option value="other">Other</option>
+      </select>
+      <label>Details (optional)</label>
+      <textarea id="reportDetails" rows="3" placeholder="Describe what you witnessed..."></textarea>
+      <div class="modal-actions">
+        <button class="btn-primary" id="btnSubmitReport">SUBMIT</button>
+        <button class="btn-secondary" id="btnCancelReport">CANCEL</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════ ADMIN CONSOLE ═══════════════════════ -->
+  <div id="adminConsole" class="hidden">
+    <div id="adminLock" class="admin-section">
+      <div class="admin-title">⚙ ADMIN CONSOLE <span class="admin-sub">// GunzML MCD</span></div>
+      <div class="admin-auth-row">
+        <input id="adminPassInput" type="password" placeholder="Master password..." autocomplete="off" />
+        <button id="btnAdminAuth" class="btn-primary btn-sm">UNLOCK</button>
+      </div>
+      <div id="adminAuthMsg" class="admin-msg"></div>
+    </div>
+
+    <div id="adminPanel" class="admin-section hidden">
+      <div class="admin-title">⚙ ADMIN PANEL <span class="admin-sub">// Authenticated</span></div>
+
+      <div class="admin-tabs">
+        <button class="admin-tab active" data-tab="players">Players</button>
+        <button class="admin-tab" data-tab="bans">Bans</button>
+        <button class="admin-tab" data-tab="reports">Reports</button>
+        <button class="admin-tab" data-tab="config">Config</button>
+      </div>
+
+      <!-- Players Tab -->
+      <div id="adminTab-players" class="admin-tab-content">
+        <div id="adminPlayerList" class="admin-list"></div>
+      </div>
+
+      <!-- Bans Tab -->
+      <div id="adminTab-bans" class="admin-tab-content hidden">
+        <div id="adminBanList" class="admin-list"></div>
+        <div class="admin-input-row">
+          <input id="banIdInput" type="text" placeholder="Player ID or Name to ban..." />
+          <input id="banReasonInput" type="text" placeholder="Reason..." />
+          <button class="btn-primary btn-sm" id="btnAddBan">BAN</button>
+        </div>
+      </div>
+
+      <!-- Reports Tab -->
+      <div id="adminTab-reports" class="admin-tab-content hidden">
+        <div id="adminReportList" class="admin-list"></div>
+        <button class="btn-secondary btn-sm" id="btnClearReports">CLEAR ALL</button>
+      </div>
+
+      <!-- Config Tab -->
+      <div id="adminTab-config" class="admin-tab-content hidden">
+        <div class="config-row">
+          <label>Server URL</label>
+          <input id="cfgServer" type="text" placeholder="ws://localhost:3000" />
+        </div>
+        <div class="config-row">
+          <label>Discord Webhook</label>
+          <input id="cfgWebhook" type="text" placeholder="https://discord.com/api/webhooks/..." />
+        </div>
+        <div class="config-row">
+          <label>Change Admin Password</label>
+          <input id="cfgNewPass" type="password" placeholder="New password..." />
+        </div>
+        <button class="btn-primary btn-sm" id="btnSaveConfig">SAVE CONFIG</button>
+        <div id="cfgMsg" class="admin-msg"></div>
+      </div>
+
+      <button class="btn-secondary btn-sm" id="btnAdminLock" style="margin-top:12px">🔒 LOCK CONSOLE</button>
+    </div>
+
+    <button class="admin-close" id="btnAdminClose">✕</button>
+  </div>
+
+  <!-- ═══════════════════════ NOTIFICATION TOAST ═══════════════════════ -->
+  <div id="toastContainer"></div>
+
+  <!-- ═══════════════════════ SCRIPTS ═══════════════════════ -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/cannon.js/0.6.2/cannon.min.js"></script>
+  <!-- Socket.io: replace with your server CDN or local copy when you have a backend -->
+  <script>
+    // Graceful Socket.io stub — replaced when a real server is configured
+    window.__socketStub = true;
+  </script>
+  <script src="main.js"></script>
+</body>
+</html>
