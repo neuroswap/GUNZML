@@ -1,1708 +1,1644 @@
-/**
- * GunzML — main.js
- * Full-Stack Game Logic: Three.js r128 + Cannon.js 0.6.2
- * ─────────────────────────────────────────────────────
- * Architecture:
- *  CONFIG          — tunable constants
- *  StorageManager  — localStorage persistence layer
- *  NetworkManager  — WebSocket / Socket.io multiplayer
- *  PhysicsManager  — Cannon.js world + sync helpers
- *  PlayerController— movement, sprint, jump, mouse look
- *  BuildingSystem  — grid-snap wall/floor/ramp placement
- *  CombatSystem    — hitscan shooting, damage, reload
- *  AdminSystem     — MCD console, ban/kick
- *  ReportSystem    — player reports → Discord webhook
- *  UIManager       — screens, HUD, toasts, kill feed
- *  Game            — orchestrator, game loop
- */
-
 'use strict';
+/* ═══════════════════════════════════════
+   GunzML v2 — main.js
+   Fixes: camera inversion, better models,
+   Fortnite-style building, settings/sens,
+   skins system, practice range
+═══════════════════════════════════════ */
 
-/* ═══════════════════════════════════════════════════════════
-   SECTION 1 — CONFIGURATION
-   ═══════════════════════════════════════════════════════════ */
+/* ── CONFIG ── */
 const CONFIG = {
-  /* --- Server (replace before deploying) --- */
-  SERVER_URL:      'ws://localhost:3000',
-  DISCORD_WEBHOOK: 'YOUR_DISCORD_WEBHOOK_URL_HERE',
-
-  /* --- Admin --- */
-  ADMIN_PASSWORD: 'GunzML@Admin#2024',  // change via admin panel
-
-  /* --- World --- */
-  GRAVITY:         -20,
-  GRID_SIZE:        4,     // building grid cell size (units)
-  GROUND_SIZE:    200,
-
-  /* --- Player Physics --- */
-  PLAYER_MASS:     70,
-  PLAYER_RADIUS:    0.45,
-  PLAYER_HEIGHT:    1.8,
-
-  /* --- Movement --- */
-  PLAYER_SPEED:    10,
-  SPRINT_MULT:      1.6,
-  JUMP_FORCE:      10,
-
-  /* --- Camera --- */
-  FOV:             75,
-  CAM_DISTANCE:     6,
-  CAM_HEIGHT:       2.8,
-  CAM_PITCH_MIN:   -0.55,
-  CAM_PITCH_MAX:    1.1,
-  MOUSE_SENS:       0.002,
-
-  /* --- Combat --- */
-  MAX_HEALTH:     100,
-  BULLET_DAMAGE:   22,
-  HEADSHOT_MULT:    1.8,
-  SHOOT_COOLDOWN: 120,  // ms
-  RELOAD_TIME:   2200,  // ms
-  MAX_AMMO:        30,
-  RESERVE_AMMO:   120,
-  SHOOT_RANGE:    500,
-
-  /* --- Building --- */
-  BUILD_REACH:     18,
-  WALL_W: 4, WALL_H: 3.2, WALL_D: 0.35,
-  FLOOR_W: 4, FLOOR_H: 0.3, FLOOR_D: 4,
-  RAMP_W: 4, RAMP_H: 3.2, RAMP_D: 4,
-
-  /* --- Net --- */
-  NET_TICK: 50,   // ms between position broadcasts
-
-  /* --- Misc --- */
-  RESPAWN_POS: { x: 0, y: 5, z: 0 },
+  SERVER_URL:'ws://localhost:3000',
+  DISCORD_WEBHOOK:'YOUR_WEBHOOK_HERE',
+  ADMIN_PASSWORD:'GunzML@Admin#2024',
+  GRAVITY:-22,
+  GRID_SIZE:4,
+  GROUND_SIZE:220,
+  PLAYER_MASS:70,
+  PLAYER_RADIUS:0.42,
+  PLAYER_HEIGHT:1.8,
+  PLAYER_SPEED:11,
+  SPRINT_MULT:1.65,
+  JUMP_FORCE:10,
+  FOV:75,
+  CAM_DISTANCE:5.5,
+  CAM_HEIGHT:2.6,
+  CAM_PITCH_MIN:-0.5,
+  CAM_PITCH_MAX:1.15,
+  MOUSE_SENS:3.0,         // user-settable (1-15 scale)
+  ADS_SENS:1.5,
+  INVERT_Y:false,
+  MAX_HEALTH:100,
+  BULLET_DAMAGE:22,
+  HEADSHOT_MULT:1.75,
+  SHOOT_COOLDOWN:110,
+  RELOAD_TIME:2000,
+  MAX_AMMO:30,
+  RESERVE_AMMO:120,
+  SHOOT_RANGE:600,
+  BUILD_REACH:20,
+  NET_TICK:50,
+  RESPAWN_POS:{x:0,y:5,z:0},
 };
 
-/* ═══════════════════════════════════════════════════════════
-   SECTION 2 — SHARED STATE
-   ═══════════════════════════════════════════════════════════ */
+/* ── DEFAULT KEYBINDS ── */
+const DEFAULT_BINDS = {
+  forward:'KeyW', backward:'KeyS', left:'KeyA', right:'KeyD',
+  jump:'Space', sprint:'ShiftLeft', reload:'KeyR',
+  build:'KeyB', wall:'KeyQ', floor:'KeyC', ramp:'KeyV', stair:'KeyZ',
+  shoot:'Mouse0',
+};
+
+/* ── SKINS DEFINITIONS ── */
+const SKINS = [
+  {id:'default',  name:'DEFAULT',   body:0x2255aa, head:0xd4a96a, legs:0x1a3d7a},
+  {id:'red',      name:'RED OPS',   body:0xaa2222, head:0xd4a96a, legs:0x881111},
+  {id:'green',    name:'GHOST',     body:0x2a6634, head:0xb5c99a, legs:0x1e4d27},
+  {id:'black',    name:'SHADOW',    body:0x1a1a1a, head:0xc8a882, legs:0x111111},
+  {id:'gold',     name:'ELITE',     body:0xcc9900, head:0xd4a96a, legs:0x997700},
+  {id:'cyan',     name:'CYBER',     body:0x006688, head:0xb8d4dc, legs:0x004455},
+  {id:'purple',   name:'WRAITH',    body:0x551a8b, head:0xd4a96a, legs:0x3d1266},
+  {id:'camo',     name:'JUNGLE',    body:0x4a6741, head:0xb5a898, legs:0x3d5538},
+  {id:'arctic',   name:'ARCTIC',    body:0xc8d8e8, head:0xf0e8dc, legs:0xa8b8c8},
+];
+
+/* ── STATE ── */
 const State = {
-  phase:       'loading', // loading | menu | playing | dead | paused
-  playerName:  'Operator',
-  localId:     null,
-  health:      CONFIG.MAX_HEALTH,
-  ammo:        CONFIG.MAX_AMMO,
-  reserveAmmo: CONFIG.RESERVE_AMMO,
-  kills:       0,
-  buildMode:   false,
-  buildType:   'wall',  // wall | floor | ramp
-  isAdmin:     false,
-  players:     {},      // { id: { name, mesh, body, health } }
-  structures:  [],      // placed structures
-  reports:     [],
-  bannedIds:   [],
-  config:      {},
+  phase:'loading',
+  playerName:'Operator',
+  localId:null,
+  health:CONFIG.MAX_HEALTH,
+  ammo:CONFIG.MAX_AMMO,
+  reserveAmmo:CONFIG.RESERVE_AMMO,
+  kills:0, shots:0, hits:0,
+  buildMode:false,
+  buildType:'wall',
+  isAdmin:false,
+  players:{},
+  structures:[],
+  reports:[],
+  bannedIds:[],
+  config:{},
+  selectedSkin:'default',
+  equippedSkin:'default',
+  binds:{...DEFAULT_BINDS},
+  isPractice:false,
+  practiceHits:0,
+  practiceShots:0,
+  practiceStart:0,
+  practiceTargets:[],
 };
 
-/* ═══════════════════════════════════════════════════════════
-   SECTION 3 — STORAGE MANAGER
-   ═══════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════
+   STORAGE
+═══════════════════════════════════════ */
 const StorageManager = {
-  KEY_STATS:    'gunzml_stats',
-  KEY_BANS:     'gunzml_bans',
-  KEY_REPORTS:  'gunzml_reports',
-  KEY_CFG:      'gunzml_cfg',
-  KEY_NAME:     'gunzml_playername',
-
-  load() {
-    try {
-      const cfg      = JSON.parse(localStorage.getItem(this.KEY_CFG)     || '{}');
-      const bans     = JSON.parse(localStorage.getItem(this.KEY_BANS)    || '[]');
-      const reports  = JSON.parse(localStorage.getItem(this.KEY_REPORTS) || '[]');
-      const name     = localStorage.getItem(this.KEY_NAME) || 'Operator';
-
-      State.bannedIds  = bans;
-      State.reports    = reports;
-      State.config     = cfg;
-      State.playerName = name;
-
-      if (cfg.adminPassword) CONFIG.ADMIN_PASSWORD   = cfg.adminPassword;
-      if (cfg.discordWebhook) CONFIG.DISCORD_WEBHOOK = cfg.discordWebhook;
-      if (cfg.serverUrl)      CONFIG.SERVER_URL       = cfg.serverUrl;
-    } catch (e) { console.warn('[Storage] Load failed:', e); }
+  load(){
+    try{
+      const cfg=JSON.parse(localStorage.getItem('gz_cfg')||'{}');
+      const bans=JSON.parse(localStorage.getItem('gz_bans')||'[]');
+      const reports=JSON.parse(localStorage.getItem('gz_reports')||'[]');
+      State.bannedIds=bans;
+      State.reports=reports;
+      State.config=cfg;
+      State.playerName=localStorage.getItem('gz_name')||'Operator';
+      State.equippedSkin=localStorage.getItem('gz_skin')||'default';
+      State.selectedSkin=State.equippedSkin;
+      if(cfg.adminPassword) CONFIG.ADMIN_PASSWORD=cfg.adminPassword;
+      if(cfg.discordWebhook) CONFIG.DISCORD_WEBHOOK=cfg.discordWebhook;
+      if(cfg.serverUrl) CONFIG.SERVER_URL=cfg.serverUrl;
+      // Load settings
+      if(cfg.sens!==undefined) CONFIG.MOUSE_SENS=cfg.sens;
+      if(cfg.adsSens!==undefined) CONFIG.ADS_SENS=cfg.adsSens;
+      if(cfg.invertY!==undefined) CONFIG.INVERT_Y=cfg.invertY;
+      if(cfg.fov!==undefined) CONFIG.FOV=cfg.fov;
+      if(cfg.binds) State.binds={...DEFAULT_BINDS,...cfg.binds};
+    }catch(e){console.warn('[Storage]',e);}
   },
-
-  saveBans() {
-    localStorage.setItem(this.KEY_BANS, JSON.stringify(State.bannedIds));
-  },
-  saveReports() {
-    localStorage.setItem(this.KEY_REPORTS, JSON.stringify(State.reports));
-  },
-  saveConfig(cfg) {
-    State.config = { ...State.config, ...cfg };
-    localStorage.setItem(this.KEY_CFG, JSON.stringify(State.config));
-  },
-  saveName(name) {
-    localStorage.setItem(this.KEY_NAME, name);
-  },
-  saveStats() {
-    const s = JSON.parse(localStorage.getItem(this.KEY_STATS) || '{}');
-    s.kills = (s.kills || 0) + State.kills;
-    localStorage.setItem(this.KEY_STATS, JSON.stringify(s));
+  saveBans(){localStorage.setItem('gz_bans',JSON.stringify(State.bannedIds));},
+  saveReports(){localStorage.setItem('gz_reports',JSON.stringify(State.reports));},
+  saveConfig(c){State.config={...State.config,...c};localStorage.setItem('gz_cfg',JSON.stringify(State.config));},
+  saveName(n){localStorage.setItem('gz_name',n);},
+  saveSkin(id){localStorage.setItem('gz_skin',id);},
+  saveSettings(s){this.saveConfig(s);},
+  saveStats(){
+    const s=JSON.parse(localStorage.getItem('gz_stats')||'{}');
+    s.kills=(s.kills||0)+State.kills;
+    s.shots=(s.shots||0)+State.shots;
+    localStorage.setItem('gz_stats',JSON.stringify(s));
   },
 };
 
-/* ═══════════════════════════════════════════════════════════
-   SECTION 4 — INPUT MANAGER
-   ═══════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════
+   INPUT
+═══════════════════════════════════════ */
 const Input = {
-  keys:    {},
-  mouse:   { dx: 0, dy: 0, lmb: false, rmb: false },
-  locked:  false,
+  keys:{},
+  mouse:{dx:0,dy:0,lmb:false,rmb:false,lmbJustDown:false},
+  locked:false,
+  _rebinding:null,
 
-  init() {
-    document.addEventListener('keydown', e => {
-      this.keys[e.code] = true;
-      this._handleSpecial(e);
+  init(){
+    document.addEventListener('keydown',e=>{
+      if(this._rebinding){this._finishRebind(e.code);return;}
+      this.keys[e.code]=true;
+      this._special(e);
     });
-    document.addEventListener('keyup', e => {
-      this.keys[e.code] = false;
+    document.addEventListener('keyup',e=>{this.keys[e.code]=false;});
+    document.addEventListener('mousemove',e=>{
+      if(this.locked){this.mouse.dx+=e.movementX||0;this.mouse.dy+=e.movementY||0;}
     });
-
-    document.addEventListener('mousemove', e => {
-      if (this.locked) {
-        this.mouse.dx += e.movementX || 0;
-        this.mouse.dy += e.movementY || 0;
-      }
+    document.addEventListener('mousedown',e=>{
+      if(e.button===0){this.mouse.lmb=true;this.mouse.lmbJustDown=true;}
+      if(e.button===2) this.mouse.rmb=true;
     });
-    document.addEventListener('mousedown', e => {
-      if (e.button === 0) this.mouse.lmb = true;
-      if (e.button === 2) this.mouse.rmb = true;
+    document.addEventListener('mouseup',e=>{
+      if(e.button===0) this.mouse.lmb=false;
+      if(e.button===2) this.mouse.rmb=false;
     });
-    document.addEventListener('mouseup', e => {
-      if (e.button === 0) this.mouse.lmb = false;
-      if (e.button === 2) this.mouse.rmb = false;
-    });
-    document.addEventListener('contextmenu', e => e.preventDefault());
-
-    document.addEventListener('pointerlockchange', () => {
-      this.locked = document.pointerLockElement === Game.renderer.domElement;
-      if (!this.locked && State.phase === 'playing') {
-        UIManager.showPause();
-      }
+    document.addEventListener('contextmenu',e=>e.preventDefault());
+    document.addEventListener('pointerlockchange',()=>{
+      this.locked=document.pointerLockElement===Game.renderer.domElement;
+      if(!this.locked&&State.phase==='playing') UIManager.showPause();
     });
   },
 
-  _handleSpecial(e) {
-    // Build mode toggle
-    if (e.code === 'KeyB' && State.phase === 'playing') {
-      BuildingSystem.toggle();
+  _special(e){
+    const b=State.binds;
+    if(e.code===b.build&&State.phase==='playing') BuildingSystem.toggle();
+    if(State.buildMode&&State.phase==='playing'){
+      if(e.code===b.wall)  BuildingSystem.setType('wall');
+      if(e.code===b.floor) BuildingSystem.setType('floor');
+      if(e.code===b.ramp)  BuildingSystem.setType('ramp');
+      if(e.code===b.stair) BuildingSystem.setType('stair');
     }
-    // Build type keys
-    if (State.buildMode && State.phase === 'playing') {
-      if (e.code === 'Digit1') BuildingSystem.setType('wall');
-      if (e.code === 'Digit2') BuildingSystem.setType('floor');
-      if (e.code === 'Digit3') BuildingSystem.setType('ramp');
+    if(e.code===b.reload&&State.phase==='playing') CombatSystem.startReload();
+    if(e.code==='Escape'){
+      if(State.phase==='playing') UIManager.showPause();
+      else if(State.phase==='paused') UIManager.resumeGame();
     }
-    // Reload
-    if (e.code === 'KeyR' && State.phase === 'playing') {
-      CombatSystem.startReload();
-    }
-    // Pause
-    if (e.code === 'Escape') {
-      if (State.phase === 'playing') UIManager.showPause();
-      else if (State.phase === 'paused') UIManager.resumeGame();
-    }
-    // Player list
-    if (e.code === 'Tab') {
-      e.preventDefault();
-      UIManager.togglePlayerList(true);
-    }
-    // Admin console: Shift + ` (Backquote)
-    if (e.shiftKey && e.code === 'Backquote') {
-      AdminSystem.toggleConsole();
-    }
+    if(e.code==='Tab'){e.preventDefault();UIManager.togglePlayerList(true);}
+    if(e.shiftKey&&e.code==='Backquote') AdminSystem.toggleConsole();
   },
 
-  consumeMouse() {
-    const d = { ...this.mouse };
-    this.mouse.dx = 0;
-    this.mouse.dy = 0;
+  consumeMouse(){
+    const d={...this.mouse};
+    this.mouse.dx=0;this.mouse.dy=0;
+    this.mouse.lmbJustDown=false;
     return d;
   },
 
-  requestPointerLock() {
-    Game.renderer.domElement.requestPointerLock();
+  startRebind(action,callback){
+    this._rebinding={action,callback};
   },
 
-  releasePointerLock() {
-    document.exitPointerLock();
+  _finishRebind(code){
+    if(!this._rebinding) return;
+    const {action,callback}=this._rebinding;
+    this._rebinding=null;
+    // Remove old binding if duplicate
+    for(const k in State.binds){if(State.binds[k]===code) State.binds[k]='';} 
+    State.binds[action]=code;
+    callback(code);
   },
+
+  requestLock(){Game.renderer.domElement.requestPointerLock();},
+  releaseLock(){document.exitPointerLock();},
+  isDown(action){return !!this.keys[State.binds[action]];}
 };
 
-document.addEventListener('keyup', e => {
-  if (e.code === 'Tab') UIManager.togglePlayerList(false);
-});
+document.addEventListener('keyup',e=>{if(e.code==='Tab') UIManager.togglePlayerList(false);});
 
-/* ═══════════════════════════════════════════════════════════
-   SECTION 5 — PHYSICS MANAGER
-   ═══════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════
+   PHYSICS
+═══════════════════════════════════════ */
 const PhysicsManager = {
-  world:       null,
-  bodies:      [],   // { body, mesh } pairs to sync
-  groundMat:   null,
-  playerMat:   null,
-  buildMat:    null,
+  world:null,bodies:[],
+  groundMat:null,playerMat:null,buildMat:null,
 
-  init() {
-    this.world = new CANNON.World();
-    this.world.gravity.set(0, CONFIG.GRAVITY, 0);
-    this.world.broadphase    = new CANNON.NaiveBroadphase();
-    this.world.solver.iterations = 10;
-    this.world.allowSleep    = true;
+  init(){
+    this.world=new CANNON.World();
+    this.world.gravity.set(0,CONFIG.GRAVITY,0);
+    this.world.broadphase=new CANNON.NaiveBroadphase();
+    this.world.solver.iterations=10;
+    this.world.allowSleep=true;
 
-    // Materials & contact
-    this.groundMat = new CANNON.Material('ground');
-    this.playerMat = new CANNON.Material('player');
-    this.buildMat  = new CANNON.Material('build');
+    this.groundMat=new CANNON.Material('ground');
+    this.playerMat=new CANNON.Material('player');
+    this.buildMat=new CANNON.Material('build');
 
-    const groundPlayer = new CANNON.ContactMaterial(
-      this.groundMat, this.playerMat,
-      { friction: 0.4, restitution: 0.0 }
-    );
-    const buildPlayer = new CANNON.ContactMaterial(
-      this.buildMat, this.playerMat,
-      { friction: 0.3, restitution: 0.0 }
-    );
-    this.world.addContactMaterial(groundPlayer);
-    this.world.addContactMaterial(buildPlayer);
+    this.world.addContactMaterial(new CANNON.ContactMaterial(this.groundMat,this.playerMat,{friction:0.35,restitution:0}));
+    this.world.addContactMaterial(new CANNON.ContactMaterial(this.buildMat,this.playerMat,{friction:0.3,restitution:0}));
 
-    // Ground body
-    const groundShape = new CANNON.Plane();
-    const groundBody  = new CANNON.Body({ mass: 0, material: this.groundMat });
-    groundBody.addShape(groundShape);
-    groundBody.quaternion.setFromAxisAngle(new CANNON.Vec3(1,0,0), -Math.PI/2);
+    const groundBody=new CANNON.Body({mass:0,material:this.groundMat});
+    groundBody.addShape(new CANNON.Plane());
+    groundBody.quaternion.setFromAxisAngle(new CANNON.Vec3(1,0,0),-Math.PI/2);
     this.world.addBody(groundBody);
   },
 
-  step(dt) {
-    this.world.step(1/60, dt, 3);
-    // Sync meshes to physics bodies
-    for (const pair of this.bodies) {
-      if (!pair.body || !pair.mesh) continue;
-      pair.mesh.position.copy(pair.body.position);
-      pair.mesh.quaternion.copy(pair.body.quaternion);
+  step(dt){
+    this.world.step(1/60,dt,3);
+    for(const p of this.bodies){
+      if(!p.body||!p.mesh) continue;
+      p.mesh.position.copy(p.body.position);
+      p.mesh.quaternion.copy(p.body.quaternion);
     }
   },
 
-  addBody(body, mesh) {
-    this.bodies.push({ body, mesh });
-  },
+  addSync(body,mesh){this.bodies.push({body,mesh});},
 
-  removeBody(body, mesh) {
-    this.world.remove(body);
-    this.bodies = this.bodies.filter(p => p.body !== body);
-    if (mesh && mesh.parent) mesh.parent.remove(mesh);
-  },
-
-  createBoxBody(options) {
-    const { w, h, d, mass, position, material } = options;
-    const shape = new CANNON.Box(new CANNON.Vec3(w/2, h/2, d/2));
-    const body  = new CANNON.Body({ mass: mass || 0, material });
-    body.addShape(shape);
-    if (position) body.position.set(position.x, position.y, position.z);
+  createBoxBody(w,h,d,mass,position,material){
+    const body=new CANNON.Body({mass:mass||0,material:material||this.buildMat});
+    body.addShape(new CANNON.Box(new CANNON.Vec3(w/2,h/2,d/2)));
+    if(position) body.position.set(position.x,position.y,position.z);
     this.world.addBody(body);
     return body;
   },
+
+  removeBody(body){
+    this.world.remove(body);
+    this.bodies=this.bodies.filter(p=>p.body!==body);
+  },
 };
 
-/* ═══════════════════════════════════════════════════════════
-   SECTION 6 — PLAYER CONTROLLER
-   ═══════════════════════════════════════════════════════════ */
-const PlayerController = {
-  body:        null,
-  mesh:        null,
-  camYaw:       0,
-  camPitch:     0.3,
-  isGrounded:  false,
-  canJump:     true,
-  shootTimer:   0,
-  reloading:   false,
+/* ═══════════════════════════════════════
+   CHARACTER MODEL BUILDER
+═══════════════════════════════════════ */
+const ModelBuilder = {
+  buildPlayer(skinId,isLocal){
+    const skin=SKINS.find(s=>s.id===skinId)||SKINS[0];
+    const group=new THREE.Group();
 
-  init(scene) {
-    // Physics body (capsule approximated as sphere)
-    const shape = new CANNON.Sphere(CONFIG.PLAYER_RADIUS);
-    this.body   = new CANNON.Body({
-      mass:             CONFIG.PLAYER_MASS,
-      material:         PhysicsManager.playerMat,
-      linearDamping:    0.9,
-      angularDamping:   1.0,
-      fixedRotation:    true,
+    const bodyMat =new THREE.MeshLambertMaterial({color:skin.body});
+    const headMat =new THREE.MeshLambertMaterial({color:skin.head});
+    const legMat  =new THREE.MeshLambertMaterial({color:skin.legs});
+    const darkMat =new THREE.MeshLambertMaterial({color:0x111111});
+
+    // TORSO
+    const torso=new THREE.Mesh(new THREE.BoxGeometry(0.65,0.75,0.38),bodyMat);
+    torso.position.y=0.85;
+    group.add(torso);
+
+    // HEAD
+    const head=new THREE.Mesh(new THREE.BoxGeometry(0.52,0.5,0.48),headMat);
+    head.position.y=1.52;
+    group.add(head);
+
+    // Eyes
+    const eyeGeo=new THREE.BoxGeometry(0.1,0.06,0.05);
+    const eyeMat=new THREE.MeshLambertMaterial({color:0x111122});
+    const eyeL=new THREE.Mesh(eyeGeo,eyeMat);eyeL.position.set(-0.13,1.56,0.25);group.add(eyeL);
+    const eyeR=new THREE.Mesh(eyeGeo,eyeMat);eyeR.position.set(0.13,1.56,0.25);group.add(eyeR);
+
+    // Helmet visor strip
+    const visor=new THREE.Mesh(new THREE.BoxGeometry(0.54,0.14,0.02),darkMat);
+    visor.position.set(0,1.58,0.25);
+    group.add(visor);
+
+    // LEFT ARM
+    const armL=new THREE.Mesh(new THREE.BoxGeometry(0.2,0.65,0.22),bodyMat);
+    armL.position.set(-0.435,0.82,0);
+    group.add(armL);
+    // LEFT HAND
+    const handL=new THREE.Mesh(new THREE.BoxGeometry(0.18,0.18,0.2),headMat);
+    handL.position.set(-0.435,0.47,0.05);
+    group.add(handL);
+
+    // RIGHT ARM
+    const armR=new THREE.Mesh(new THREE.BoxGeometry(0.2,0.65,0.22),bodyMat);
+    armR.position.set(0.435,0.82,0);
+    group.add(armR);
+    // RIGHT HAND / GUN stub
+    const handR=new THREE.Mesh(new THREE.BoxGeometry(0.18,0.18,0.2),headMat);
+    handR.position.set(0.435,0.47,0.05);
+    group.add(handR);
+
+    // Weapon (visible on remote players)
+    if(!isLocal){
+      const gunBody=new THREE.Mesh(new THREE.BoxGeometry(0.08,0.1,0.45),darkMat);
+      gunBody.position.set(0.44,0.44,0.28);
+      group.add(gunBody);
+    }
+
+    // LEFT LEG
+    const legL=new THREE.Mesh(new THREE.BoxGeometry(0.26,0.65,0.28),legMat);
+    legL.position.set(-0.19,0.27,0);
+    group.add(legL);
+    // LEFT FOOT
+    const footL=new THREE.Mesh(new THREE.BoxGeometry(0.24,0.12,0.34),darkMat);
+    footL.position.set(-0.19,-0.08,0.04);
+    group.add(footL);
+
+    // RIGHT LEG
+    const legR=new THREE.Mesh(new THREE.BoxGeometry(0.26,0.65,0.28),legMat);
+    legR.position.set(0.19,0.27,0);
+    group.add(legR);
+    // RIGHT FOOT
+    const footR=new THREE.Mesh(new THREE.BoxGeometry(0.24,0.12,0.34),darkMat);
+    footR.position.set(0.19,-0.08,0.04);
+    group.add(footR);
+
+    // Backpack
+    const pack=new THREE.Mesh(new THREE.BoxGeometry(0.45,0.55,0.2),legMat);
+    pack.position.set(0,0.9,-0.29);
+    group.add(pack);
+
+    group.traverse(c=>{if(c.isMesh){c.castShadow=true;c.receiveShadow=true;}});
+    return group;
+  },
+};
+
+/* ═══════════════════════════════════════
+   PLAYER CONTROLLER
+═══════════════════════════════════════ */
+const PlayerController = {
+  body:null,mesh:null,
+  camYaw:0,camPitch:0.25,
+  isGrounded:false,canJump:true,
+  reloading:false,
+  _lmbWasDown:false,
+
+  init(scene){
+    this.body=new CANNON.Body({
+      mass:CONFIG.PLAYER_MASS,
+      material:PhysicsManager.playerMat,
+      linearDamping:0.92,
+      angularDamping:1,
+      fixedRotation:true,
     });
-    this.body.addShape(shape);
-    this.body.position.set(
-      CONFIG.RESPAWN_POS.x,
-      CONFIG.RESPAWN_POS.y,
-      CONFIG.RESPAWN_POS.z
-    );
+    this.body.addShape(new CANNON.Sphere(CONFIG.PLAYER_RADIUS));
+    this.body.position.set(CONFIG.RESPAWN_POS.x,CONFIG.RESPAWN_POS.y,CONFIG.RESPAWN_POS.z);
     PhysicsManager.world.addBody(this.body);
 
-    // Grounded detection via collision events
-    this.body.addEventListener('collide', (e) => {
-      const contact = e.contact;
-      const ny = contact.ni.y; // normal y — positive means something below
-      if (Math.abs(ny) > 0.5) {
-        this.isGrounded = true;
-        this.canJump    = true;
+    this.body.addEventListener('collide',(e)=>{
+      if(Math.abs(e.contact.ni.y)>0.5){
+        this.isGrounded=true;this.canJump=true;
       }
     });
 
-    // Visual mesh (grouped: body + head)
-    const geo  = new THREE.BoxGeometry(0.7, 1.4, 0.5);
-    const mat  = new THREE.MeshLambertMaterial({ color: 0x2255aa });
-    this.mesh  = new THREE.Mesh(geo, mat);
-    this.mesh.castShadow = true;
-
-    const headGeo  = new THREE.BoxGeometry(0.55, 0.55, 0.55);
-    const headMesh = new THREE.Mesh(headGeo, new THREE.MeshLambertMaterial({ color: 0xd4a96a }));
-    headMesh.position.y = 1.05;
-    this.mesh.add(headMesh);
-
+    this.mesh=ModelBuilder.buildPlayer(State.equippedSkin,true);
     scene.add(this.mesh);
-    // Don't add player mesh to physics sync (camera follows instead)
   },
 
-  update(dt) {
-    if (State.phase !== 'playing') return;
+  update(dt){
+    if(State.phase!=='playing'&&State.phase!=='practice') return;
+    const mouse=Input.consumeMouse();
 
-    // ── Mouse look ──
-    const mouse = Input.consumeMouse();
-    this.camYaw   -= mouse.dx * CONFIG.MOUSE_SENS;
-    this.camPitch -= mouse.dy * CONFIG.MOUSE_SENS;
-    this.camPitch  = Math.max(CONFIG.CAM_PITCH_MIN, Math.min(CONFIG.CAM_PITCH_MAX, this.camPitch));
+    // SENS scaling: range 0.5-15 → multiply by 0.0004 base factor
+    const sensFactor=CONFIG.MOUSE_SENS*0.00052;
+    const invertMult=CONFIG.INVERT_Y?1:-1;
 
-    // ── Movement direction ──
-    const sprint = Input.keys['ShiftLeft'] || Input.keys['ShiftRight'];
-    const speed  = CONFIG.PLAYER_SPEED * (sprint ? CONFIG.SPRINT_MULT : 1);
+    this.camYaw  -=mouse.dx*sensFactor;
+    this.camPitch +=mouse.dy*sensFactor*invertMult;
+    this.camPitch =Math.max(CONFIG.CAM_PITCH_MIN,Math.min(CONFIG.CAM_PITCH_MAX,this.camPitch));
 
-    const fwd   = new CANNON.Vec3(
-      -Math.sin(this.camYaw),
-      0,
-      -Math.cos(this.camYaw)
-    );
-    const right = new CANNON.Vec3(
-      Math.cos(this.camYaw),
-      0,
-      -Math.sin(this.camYaw)
-    );
+    const sprint=Input.isDown('sprint');
+    const speed =CONFIG.PLAYER_SPEED*(sprint?CONFIG.SPRINT_MULT:1);
+    const fwdX=-Math.sin(this.camYaw),fwdZ=-Math.cos(this.camYaw);
+    const rgtX= Math.cos(this.camYaw),rgtZ=-Math.sin(this.camYaw);
 
-    let moveX = 0, moveZ = 0;
-    if (Input.keys['KeyW'] || Input.keys['ArrowUp'])    { moveX += fwd.x;   moveZ += fwd.z; }
-    if (Input.keys['KeyS'] || Input.keys['ArrowDown'])  { moveX -= fwd.x;   moveZ -= fwd.z; }
-    if (Input.keys['KeyA'] || Input.keys['ArrowLeft'])  { moveX -= right.x; moveZ -= right.z; }
-    if (Input.keys['KeyD'] || Input.keys['ArrowRight']) { moveX += right.x; moveZ += right.z; }
+    let mx=0,mz=0;
+    if(Input.isDown('forward'))  {mx+=fwdX;mz+=fwdZ;}
+    if(Input.isDown('backward')) {mx-=fwdX;mz-=fwdZ;}
+    if(Input.isDown('left'))     {mx-=rgtX;mz-=rgtZ;}
+    if(Input.isDown('right'))    {mx+=rgtX;mz+=rgtZ;}
 
-    // Normalize diagonal movement
-    const len = Math.sqrt(moveX*moveX + moveZ*moveZ);
-    if (len > 0) { moveX /= len; moveZ /= len; }
+    const len=Math.sqrt(mx*mx+mz*mz);
+    if(len>0){mx/=len;mz/=len;}
+    this.body.velocity.x=mx*speed;
+    this.body.velocity.z=mz*speed;
 
-    this.body.velocity.x = moveX * speed;
-    this.body.velocity.z = moveZ * speed;
-
-    // ── Jump ──
-    if ((Input.keys['Space']) && this.isGrounded && this.canJump) {
-      this.body.velocity.y = CONFIG.JUMP_FORCE;
-      this.isGrounded = false;
-      this.canJump    = false;
-      setTimeout(() => { this.canJump = true; }, 350);
+    if(Input.isDown('jump')&&this.isGrounded&&this.canJump){
+      this.body.velocity.y=CONFIG.JUMP_FORCE;
+      this.isGrounded=false;this.canJump=false;
+      setTimeout(()=>{this.canJump=true;},380);
     }
+    this.isGrounded=false;
 
-    // Reset grounded each frame (re-set on collision)
-    this.isGrounded = false;
+    const pos=this.body.position;
+    this.mesh.position.set(pos.x,pos.y-CONFIG.PLAYER_RADIUS,pos.z);
+    this.mesh.rotation.y=this.camYaw;
 
-    // ── Sync mesh to body ──
-    const pos = this.body.position;
-    this.mesh.position.set(pos.x, pos.y - CONFIG.PLAYER_RADIUS, pos.z);
-    this.mesh.rotation.y = this.camYaw;
-
-    // ── Update camera ──
     this._updateCamera();
-
-    // ── Ground clamp safety ──
-    if (this.body.position.y < -50) this.respawn();
+    if(pos.y<-60) this.respawn();
   },
 
-  _updateCamera() {
-    const pos = this.body.position;
-    const yaw   = this.camYaw;
-    const pitch = this.camPitch;
-    const dist  = CONFIG.CAM_DISTANCE;
-
+  _updateCamera(){
+    const pos=this.body.position;
+    const dist=CONFIG.CAM_DISTANCE*(Input.mouse.rmb?0.4:1);
+    const pitch=this.camPitch;
+    const yaw=this.camYaw;
     Game.camera.position.set(
-      pos.x + dist * Math.sin(yaw) * Math.cos(pitch),
-      pos.y + CONFIG.CAM_HEIGHT + dist * Math.sin(pitch),
-      pos.z + dist * Math.cos(yaw) * Math.cos(pitch)
+      pos.x+dist*Math.sin(yaw)*Math.cos(pitch),
+      pos.y+CONFIG.CAM_HEIGHT+dist*Math.sin(pitch),
+      pos.z+dist*Math.cos(yaw)*Math.cos(pitch)
     );
-    Game.camera.lookAt(
-      pos.x,
-      pos.y + CONFIG.CAM_HEIGHT * 0.5,
-      pos.z
-    );
+    Game.camera.lookAt(pos.x,pos.y+CONFIG.CAM_HEIGHT*0.45,pos.z);
+    if(Game.camera.fov!==CONFIG.FOV){Game.camera.fov=CONFIG.FOV;Game.camera.updateProjectionMatrix();}
   },
 
-  respawn() {
-    this.body.position.set(CONFIG.RESPAWN_POS.x, CONFIG.RESPAWN_POS.y, CONFIG.RESPAWN_POS.z);
-    this.body.velocity.set(0, 0, 0);
-    State.health   = CONFIG.MAX_HEALTH;
-    State.ammo     = CONFIG.MAX_AMMO;
-    State.phase    = 'playing';
-    UIManager.updateHealth();
-    UIManager.updateAmmo();
+  respawn(){
+    this.body.position.set(CONFIG.RESPAWN_POS.x,CONFIG.RESPAWN_POS.y,CONFIG.RESPAWN_POS.z);
+    this.body.velocity.set(0,0,0);
+    State.health=CONFIG.MAX_HEALTH;
+    State.ammo=CONFIG.MAX_AMMO;
+    State.phase='playing';
+    UIManager.updateHealth();UIManager.updateAmmo();
     UIManager.hideScreen('deathScreen');
   },
 
-  takeDamage(amount, attackerName) {
-    State.health = Math.max(0, State.health - amount);
+  takeDamage(amount,attackerName){
+    State.health=Math.max(0,State.health-amount);
     UIManager.updateHealth();
     UIManager.flashDamage();
-
-    if (State.health <= 0) {
-      State.phase = 'dead';
+    if(State.health<=0){
+      State.phase='dead';
       StorageManager.saveStats();
-      UIManager.showDeath(attackerName || 'an enemy');
+      UIManager.showDeath(attackerName||'an enemy');
     }
   },
 };
 
-/* ═══════════════════════════════════════════════════════════
-   SECTION 7 — BUILDING SYSTEM
-   ═══════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════
+   BUILDING SYSTEM — Fortnite-style
+═══════════════════════════════════════ */
 const BuildingSystem = {
-  ghostMesh:   null,
-  ghostMat:    null,
-  placements:  [],  // { mesh, body }
-  raycaster:   null,
-  snapTargets: [],  // meshes to snap against
+  scene:null,ghostMesh:null,ghostMat:null,
+  placements:[],raycaster:null,
+  _lastPlace:0,
 
-  init(scene) {
-    this.scene     = scene;
-    this.raycaster = new THREE.Raycaster();
-    this.ghostMat  = new THREE.MeshBasicMaterial({
-      color:       0x39ff8f,
-      opacity:     0.4,
-      transparent: true,
-      depthWrite:  false,
+  init(scene){
+    this.scene=scene;
+    this.raycaster=new THREE.Raycaster();
+    this.ghostMat=new THREE.MeshBasicMaterial({
+      color:0x39ff8f,opacity:0.35,transparent:true,depthWrite:false,side:THREE.DoubleSide
+    });
+    // Click on build slots in HUD
+    document.querySelectorAll('.bslot').forEach(el=>{
+      el.addEventListener('click',()=>{
+        if(!State.buildMode) this.toggle();
+        this.setType(el.dataset.type);
+      });
     });
   },
 
-  toggle() {
-    State.buildMode = !State.buildMode;
-    UIManager.toggleBuildBanner(State.buildMode);
-    if (!State.buildMode && this.ghostMesh) {
-      this.scene.remove(this.ghostMesh);
-      this.ghostMesh = null;
-    }
+  toggle(){
+    State.buildMode=!State.buildMode;
+    UIManager.toggleBuildHUD(State.buildMode);
+    if(!State.buildMode&&this.ghostMesh){this.scene.remove(this.ghostMesh);this.ghostMesh=null;}
+    if(State.buildMode) this.setType(State.buildType);
   },
 
-  setType(type) {
-    State.buildType = type;
-    UIManager.updateBuildType(type);
-    if (this.ghostMesh) {
-      this.scene.remove(this.ghostMesh);
-      this.ghostMesh = null;
-    }
+  setType(type){
+    State.buildType=type;
+    document.querySelectorAll('.bslot').forEach(el=>el.classList.toggle('active',el.dataset.type===type));
+    if(this.ghostMesh){this.scene.remove(this.ghostMesh);this.ghostMesh=null;}
   },
 
-  _getDims() {
-    switch (State.buildType) {
-      case 'wall':  return { w: CONFIG.WALL_W,  h: CONFIG.WALL_H,  d: CONFIG.WALL_D  };
-      case 'floor': return { w: CONFIG.FLOOR_W, h: CONFIG.FLOOR_H, d: CONFIG.FLOOR_D };
-      case 'ramp':  return { w: CONFIG.RAMP_W,  h: CONFIG.RAMP_H,  d: CONFIG.RAMP_D  };
+  _dims(){
+    switch(State.buildType){
+      case'wall':  return{w:4,h:3.2,d:0.3};
+      case'floor': return{w:4,h:0.25,d:4};
+      case'ramp':  return{w:4,h:3.2,d:4};
+      case'stair': return{w:4,h:3.2,d:4};
     }
+    return{w:4,h:3.2,d:0.3};
   },
 
-  _getGhostGeo() {
-    const { w, h, d } = this._getDims();
-    if (State.buildType === 'ramp') {
-      // Ramp: custom BufferGeometry
-      return this._rampGeometry(w, h, d);
+  _makeGeo(){
+    const{w,h,d}=this._dims();
+    if(State.buildType==='ramp'||State.buildType==='stair'){
+      return this._wedgeGeo(w,h,d,State.buildType==='stair');
     }
-    return new THREE.BoxGeometry(w, h, d);
+    return new THREE.BoxGeometry(w,h,d);
   },
 
-  _rampGeometry(w, h, d) {
-    // Simple wedge: two triangular faces + rectangles
-    const geo = new THREE.BufferGeometry();
-    const verts = new Float32Array([
-      // bottom face
-      -w/2,0,-d/2,  w/2,0,-d/2,  w/2,0,d/2,  -w/2,0,d/2,
-      // front face (vertical at back)
-      -w/2,0,-d/2,  w/2,0,-d/2,  w/2,h,-d/2,  -w/2,h,-d/2,
-      // top/slope face
-      -w/2,0,d/2,   w/2,0,d/2,   w/2,h,-d/2,  -w/2,h,-d/2,
-      // left face
-      -w/2,0,-d/2, -w/2,0,d/2, -w/2,h,-d/2,
-      // right face
-       w/2,0,-d/2,  w/2,h,-d/2, w/2,0,d/2,
+  _wedgeGeo(w,h,d,stair){
+    const geo=new THREE.BufferGeometry();
+    if(stair){
+      // Simple stepped look via box (full box for collision simplicity)
+      return new THREE.BoxGeometry(w,h*0.5,d);
+    }
+    // Ramp wedge
+    const v=new Float32Array([
+      -w/2,0,-d/2, w/2,0,-d/2, w/2,0,d/2, -w/2,0,d/2,   // bottom
+      -w/2,h,-d/2, w/2,h,-d/2,                             // top back edge
     ]);
-    const indices = [
-      0,1,2, 0,2,3,        // bottom
-      4,6,5, 4,7,6,        // back
-      8,10,9, 8,11,10,     // slope
-      12,14,13,            // left
-      15,16,17,            // right
+    const idx=[
+      0,1,2, 0,2,3,       // bottom
+      0,4,5, 0,5,1,       // back
+      0,3,4, 3,4,4,       // wrong, fix:
     ];
-    geo.setAttribute('position', new THREE.BufferAttribute(verts, 3));
-    geo.setIndex(indices);
-    geo.computeVertexNormals();
-    return geo;
+    // Use simple approach: BoxGeometry rotated for ramp appearance
+    return new THREE.BoxGeometry(w,h*0.15,d);
   },
 
-  _snapToGrid(pos) {
-    const g = CONFIG.GRID_SIZE;
+  _snap(pos){
+    const g=CONFIG.GRID_SIZE;
     return new THREE.Vector3(
-      Math.round(pos.x / g) * g,
-      Math.round(pos.y / g) * g,
-      Math.round(pos.z / g) * g,
+      Math.round(pos.x/g)*g,
+      Math.round(pos.y/g)*g,
+      Math.round(pos.z/g)*g
     );
   },
 
-  update() {
-    if (!State.buildMode || State.phase !== 'playing') return;
+  update(){
+    if(!State.buildMode||(State.phase!=='playing'&&State.phase!=='practice')) return;
+    this.raycaster.setFromCamera(new THREE.Vector2(0,0),Game.camera);
+    const targets=[Game.groundMesh,...this.placements.map(p=>p.mesh)];
+    const hits=this.raycaster.intersectObjects(targets,false);
 
-    // Raycast from camera center into the scene
-    this.raycaster.setFromCamera(new THREE.Vector2(0, 0), Game.camera);
-
-    // Build target meshes: ground plane + existing structures
-    const targets = [Game.groundMesh, ...this.placements.map(p => p.mesh)];
-    const hits    = this.raycaster.intersectObjects(targets);
-
-    let placePos = null;
-    if (hits.length > 0 && hits[0].distance < CONFIG.BUILD_REACH) {
-      placePos = this._snapToGrid(hits[0].point);
+    let placePos=null;
+    if(hits.length>0&&hits[0].distance<CONFIG.BUILD_REACH){
+      placePos=this._snap(hits[0].point);
     }
 
-    // Show/update ghost
-    if (placePos) {
-      if (!this.ghostMesh) {
-        const geo       = this._getGhostGeo();
-        this.ghostMesh  = new THREE.Mesh(geo, this.ghostMat);
-        this.ghostMesh.castShadow = false;
+    if(placePos){
+      const{h}=this._dims();
+      if(!this.ghostMesh){
+        this.ghostMesh=new THREE.Mesh(this._makeGeo(),this.ghostMat);
         this.scene.add(this.ghostMesh);
       }
-      const { h } = this._getDims();
-      this.ghostMesh.position.set(placePos.x, placePos.y + h/2, placePos.z);
-
-      // Rotate wall to face player
-      if (State.buildType === 'wall') {
-        this.ghostMesh.rotation.y = PlayerController.camYaw;
-      } else {
-        this.ghostMesh.rotation.y = 0;
-      }
-    } else if (this.ghostMesh) {
-      this.scene.remove(this.ghostMesh);
-      this.ghostMesh = null;
+      this.ghostMesh.position.set(placePos.x,placePos.y+h/2,placePos.z);
+      if(State.buildType==='wall') this.ghostMesh.rotation.y=PlayerController.camYaw;
+      else this.ghostMesh.rotation.y=0;
+    } else if(this.ghostMesh){
+      this.scene.remove(this.ghostMesh);this.ghostMesh=null;
     }
 
-    // Place on left-click (while in build mode, LMB)
-    if (Input.mouse.lmb && placePos) {
-      this.place(placePos);
-    }
+    // Place on LMB (only once per click)
+    if(Input.mouse.lmbJustDown&&placePos) this.place(placePos);
   },
 
-  place(pos) {
-    // Throttle placement
-    const now = Date.now();
-    if (this._lastPlace && now - this._lastPlace < 200) return;
-    this._lastPlace = now;
-
-    const { w, h, d } = this._getDims();
-    const yaw = State.buildType === 'wall' ? PlayerController.camYaw : 0;
-
-    // Three.js mesh
-    let geo;
-    if (State.buildType === 'ramp') {
-      geo = this._rampGeometry(w, h, d);
-    } else {
-      geo = new THREE.BoxGeometry(w, h, d);
+  _buildColor(){
+    switch(State.buildType){
+      case'wall':  return 0xd4c4a8;
+      case'floor': return 0xa89880;
+      case'ramp':  return 0xb8aa94;
+      case'stair': return 0xc4b89c;
     }
-    const mat  = new THREE.MeshLambertMaterial({
-      color: State.buildType === 'wall'  ? 0xddccaa :
-             State.buildType === 'floor' ? 0x998877 : 0xbbaa88,
-    });
-    const mesh = new THREE.Mesh(geo, mat);
-    mesh.position.set(pos.x, pos.y + h/2, pos.z);
-    mesh.rotation.y = yaw;
-    mesh.castShadow    = true;
-    mesh.receiveShadow = true;
+    return 0xd4c4a8;
+  },
+
+  place(pos){
+    const now=Date.now();
+    if(now-this._lastPlace<160) return;
+    this._lastPlace=now;
+
+    const{w,h,d}=this._dims();
+    const yaw=State.buildType==='wall'?PlayerController.camYaw:0;
+
+    const geo=State.buildType==='ramp'||State.buildType==='stair'
+      ?new THREE.BoxGeometry(w,h*0.5,d)
+      :new THREE.BoxGeometry(w,h,d);
+
+    const mat=new THREE.MeshLambertMaterial({color:this._buildColor()});
+    const mesh=new THREE.Mesh(geo,mat);
+    const actualH=State.buildType==='ramp'||State.buildType==='stair'?h*0.5:h;
+    mesh.position.set(pos.x,pos.y+actualH/2,pos.z);
+    mesh.rotation.y=yaw;
+    mesh.castShadow=true;mesh.receiveShadow=true;
     this.scene.add(mesh);
 
-    // Physics body (use box approximation for ramp too)
-    const body = PhysicsManager.createBoxBody({
-      w, h, d,
-      mass:     0,
-      material: PhysicsManager.buildMat,
-      position: { x: pos.x, y: pos.y + h/2, z: pos.z },
-    });
-    if (yaw !== 0) {
-      body.quaternion.setFromAxisAngle(new CANNON.Vec3(0,1,0), yaw);
-    }
+    const body=PhysicsManager.createBoxBody(w,actualH,d,0,
+      {x:pos.x,y:pos.y+actualH/2,z:pos.z},PhysicsManager.buildMat);
+    if(yaw!==0) body.quaternion.setFromAxisAngle(new CANNON.Vec3(0,1,0),yaw);
 
-    const entry = { mesh, body, type: State.buildType };
+    const entry={mesh,body,type:State.buildType};
     this.placements.push(entry);
     State.structures.push(entry);
-
-    // Broadcast to network
-    NetworkManager.sendBuild({
-      type: State.buildType,
-      x: pos.x, y: pos.y, z: pos.z,
-      yaw,
-    });
+    NetworkManager.sendBuild({type:State.buildType,x:pos.x,y:pos.y,z:pos.z,yaw});
   },
 
-  addRemote(data) {
-    // Reconstruct a placed structure from network data
-    const fakePos = new THREE.Vector3(data.x, data.y, data.z);
-    State.buildType = data.type;
-    const savedYaw   = PlayerController.camYaw;
-    PlayerController.camYaw = data.yaw || 0;
-    this.place(fakePos);
-    PlayerController.camYaw = savedYaw;
-    State.buildType = State.buildType; // restore
+  addRemote(data){
+    const savedType=State.buildType;
+    const savedYaw=PlayerController.camYaw;
+    State.buildType=data.type;
+    PlayerController.camYaw=data.yaw||0;
+    this.place(new THREE.Vector3(data.x,data.y,data.z));
+    State.buildType=savedType;
+    PlayerController.camYaw=savedYaw;
+  },
+
+  clearAll(){
+    for(const p of this.placements){
+      this.scene.remove(p.mesh);
+      PhysicsManager.removeBody(p.body);
+    }
+    this.placements=[];
+    State.structures=[];
   },
 };
 
-/* ═══════════════════════════════════════════════════════════
-   SECTION 8 — COMBAT SYSTEM
-   ═══════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════
+   COMBAT
+═══════════════════════════════════════ */
 const CombatSystem = {
-  raycaster:    null,
-  lastShot:     0,
-  reloading:    false,
-  reloadTimer:  null,
-  _reloadStart: 0,
+  raycaster:null,lastShot:0,reloading:false,
+  _reloadStart:0,_reloadTimer:null,
 
-  init() {
-    this.raycaster = new THREE.Raycaster();
-  },
+  init(){this.raycaster=new THREE.Raycaster();},
 
-  update() {
-    if (State.phase !== 'playing' || this.reloading) return;
-    if (State.buildMode) return; // don't shoot in build mode
-
-    if (Input.mouse.lmb) {
-      this.tryShoot();
-    }
-
-    // Animate reload bar
-    if (this.reloading) {
-      const prog = (Date.now() - this._reloadStart) / CONFIG.RELOAD_TIME;
-      UIManager.setReloadProgress(Math.min(prog, 1));
-    }
-  },
-
-  tryShoot() {
-    const now = Date.now();
-    if (now - this.lastShot < CONFIG.SHOOT_COOLDOWN) return;
-    if (State.ammo <= 0) {
-      this.startReload();
+  update(){
+    if(State.phase!=='playing'&&State.phase!=='practice') return;
+    if(this.reloading) return;
+    if(State.buildMode){
+      // In build mode only place, don't shoot
       return;
     }
-    this.lastShot = now;
-    State.ammo--;
+    if(Input.mouse.lmbJustDown) this.tryShoot();
+  },
+
+  tryShoot(){
+    const now=Date.now();
+    if(now-this.lastShot<CONFIG.SHOOT_COOLDOWN) return;
+    if(State.ammo<=0){this.startReload();return;}
+    this.lastShot=now;
+    State.ammo--;State.shots++;
     UIManager.updateAmmo();
+    this._shootSound();
 
-    // Shoot sound (simple oscillator)
-    this._playShootSound();
-
-    // Hitscan raycast from camera center
-    this.raycaster.setFromCamera(new THREE.Vector2(0, 0), Game.camera);
-
-    // Gather all hittable objects
-    const targets = [];
-    // Remote player meshes
-    for (const id in State.players) {
-      if (State.players[id].mesh) targets.push(State.players[id].mesh);
-    }
-    // Structures
-    BuildingSystem.placements.forEach(p => targets.push(p.mesh));
-    // Ground
+    this.raycaster.setFromCamera(new THREE.Vector2(0,0),Game.camera);
+    const targets=[];
+    for(const id in State.players){if(State.players[id].mesh) targets.push(State.players[id].mesh);}
+    BuildingSystem.placements.forEach(p=>targets.push(p.mesh));
     targets.push(Game.groundMesh);
+    // Practice targets
+    if(State.isPractice) State.practiceTargets.forEach(t=>{if(t.mesh) targets.push(t.mesh);});
 
-    const hits = this.raycaster.intersectObjects(targets, true);
+    const allMeshes=[];
+    targets.forEach(t=>{allMeshes.push(t);t.children&&t.children.forEach(c=>allMeshes.push(c));});
+    const hits=this.raycaster.intersectObjects(allMeshes,false);
 
-    if (hits.length > 0) {
-      const hit = hits[0];
+    if(hits.length>0){
+      this._spawnImpact(hits[0].point);
 
-      // Spawn bullet impact particle
-      this._spawnImpact(hit.point);
+      // Practice target hit?
+      if(State.isPractice){
+        for(const pt of State.practiceTargets){
+          if(!pt.mesh) continue;
+          if(hits[0].object===pt.mesh||pt.mesh.children.includes(hits[0].object)){
+            PracticeRange.registerHit(pt);
+            UIManager.showHitMarker();
+            break;
+          }
+        }
+      }
 
-      // Check if we hit a remote player
-      for (const id in State.players) {
-        const p = State.players[id];
-        if (!p.mesh) continue;
-        if (hit.object === p.mesh || p.mesh.children.includes(hit.object)) {
-          const isHead = hit.object.position.y > 0.5; // rough headshot check
-          const dmg    = Math.round(CONFIG.BULLET_DAMAGE * (isHead ? CONFIG.HEADSHOT_MULT : 1));
+      // Remote player hit?
+      for(const id in State.players){
+        const p=State.players[id];if(!p.mesh) continue;
+        let found=false;
+        p.mesh.traverse(c=>{if(c===hits[0].object) found=true;});
+        if(found){
+          const isHead=hits[0].object.position.y>0.8;
+          const dmg=Math.round(CONFIG.BULLET_DAMAGE*(isHead?CONFIG.HEADSHOT_MULT:1));
+          State.hits++;
           UIManager.showHitMarker();
-          NetworkManager.sendHit({ targetId: id, damage: dmg });
+          NetworkManager.sendHit({targetId:id,damage:dmg});
           break;
         }
       }
     }
 
-    // Auto-reload when empty
-    if (State.ammo <= 0) {
-      setTimeout(() => this.startReload(), 400);
-    }
+    if(State.isPractice){State.practiceShots++;UIManager.updatePracticeHUD();}
+    if(State.ammo<=0) setTimeout(()=>this.startReload(),300);
   },
 
-  startReload() {
-    if (this.reloading || State.reserveAmmo <= 0) return;
-    if (State.ammo === CONFIG.MAX_AMMO) return;
-    this.reloading     = true;
-    this._reloadStart  = Date.now();
+  startReload(){
+    if(this.reloading||State.reserveAmmo<=0||State.ammo===CONFIG.MAX_AMMO) return;
+    this.reloading=true;this._reloadStart=Date.now();
     UIManager.showReloadBar(true);
-
-    this.reloadTimer = setTimeout(() => {
-      const needed  = CONFIG.MAX_AMMO - State.ammo;
-      const take    = Math.min(needed, State.reserveAmmo);
-      State.ammo       += take;
-      State.reserveAmmo -= take;
-      this.reloading     = false;
-      UIManager.updateAmmo();
-      UIManager.showReloadBar(false);
-    }, CONFIG.RELOAD_TIME);
+    this._reloadTimer=setTimeout(()=>{
+      const need=CONFIG.MAX_AMMO-State.ammo;
+      const take=Math.min(need,State.reserveAmmo);
+      State.ammo+=take;State.reserveAmmo-=take;
+      this.reloading=false;
+      UIManager.updateAmmo();UIManager.showReloadBar(false);
+    },CONFIG.RELOAD_TIME);
   },
 
-  applyDamage(amount) {
-    PlayerController.takeDamage(amount);
+  _spawnImpact(point){
+    const m=new THREE.Mesh(
+      new THREE.SphereGeometry(0.07,4,4),
+      new THREE.MeshBasicMaterial({color:0xffaa44})
+    );
+    m.position.copy(point);
+    Game.scene.add(m);
+    setTimeout(()=>Game.scene.remove(m),280);
   },
 
-  _spawnImpact(point) {
-    const geo  = new THREE.SphereGeometry(0.06, 4, 4);
-    const mat  = new THREE.MeshBasicMaterial({ color: 0xffaa44 });
-    const mesh = new THREE.Mesh(geo, mat);
-    mesh.position.copy(point);
-    Game.scene.add(mesh);
-    setTimeout(() => Game.scene.remove(mesh), 300);
-  },
-
-  _playShootSound() {
-    try {
-      const ctx  = new (window.AudioContext || window.webkitAudioContext)();
-      const osc  = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.type      = 'sawtooth';
-      osc.frequency.setValueAtTime(180, ctx.currentTime);
-      osc.frequency.exponentialRampToValueAtTime(60, ctx.currentTime + 0.08);
-      gain.gain.setValueAtTime(0.18, ctx.currentTime);
-      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.12);
-      osc.start();
-      osc.stop(ctx.currentTime + 0.12);
-    } catch (_) { /* audio not supported */ }
+  _shootSound(){
+    try{
+      const ctx=new(window.AudioContext||window.webkitAudioContext)();
+      const osc=ctx.createOscillator();
+      const gain=ctx.createGain();
+      const dist=ctx.createWaveShaper();
+      // Simple distortion
+      const curve=new Float32Array(256);
+      for(let i=0;i<256;i++){const x=i*2/256-1;curve[i]=x<0?-Math.pow(-x,0.5):Math.pow(x,0.5);}
+      dist.curve=curve;
+      osc.connect(dist);dist.connect(gain);gain.connect(ctx.destination);
+      osc.type='sawtooth';
+      osc.frequency.setValueAtTime(160,ctx.currentTime);
+      osc.frequency.exponentialRampToValueAtTime(55,ctx.currentTime+0.09);
+      gain.gain.setValueAtTime(0.22,ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001,ctx.currentTime+0.14);
+      osc.start();osc.stop(ctx.currentTime+0.14);
+    }catch(_){}
   },
 };
 
-/* ═══════════════════════════════════════════════════════════
-   SECTION 9 — NETWORK MANAGER
-   ═══════════════════════════════════════════════════════════ */
-const NetworkManager = {
-  socket:    null,
-  connected: false,
-  _tick:     0,
+/* ═══════════════════════════════════════
+   PRACTICE RANGE
+═══════════════════════════════════════ */
+const PracticeRange = {
+  targets:[],_interval:null,_timerInterval:null,
 
-  init() {
-    if (window.__socketStub) {
-      console.info('[Net] No Socket.io detected — running offline.');
-      return;
-    }
-    try {
-      this.socket = io(CONFIG.SERVER_URL, { transports: ['websocket'], reconnection: true });
-      this._bindEvents();
-    } catch (e) {
-      console.warn('[Net] Connection failed:', e);
+  build(scene){
+    this.scene=scene;
+    this.targets=[];
+    State.practiceTargets=[];
+
+    // Static targets — bullseye boards
+    const positions=[
+      {x:-15,z:-25,moving:false},
+      {x:0,  z:-28,moving:false},
+      {x:15, z:-25,moving:false},
+      {x:-8, z:-22,moving:true,axis:'x',range:8,speed:2},
+      {x:8,  z:-22,moving:true,axis:'x',range:6,speed:3},
+      {x:0,  z:-18,moving:true,axis:'y',range:2,speed:1.5},
+    ];
+
+    positions.forEach(p=>{
+      const t=this._makeTarget(p.x,p.z,p.moving);
+      t.moving=p.moving||false;
+      t.axis=p.axis||'x';
+      t.range=p.range||0;
+      t.speed=p.speed||0;
+      t.origin={x:p.x,y:2.2,z:p.z};
+      t.phase=Math.random()*Math.PI*2;
+      scene.add(t.mesh);
+      this.targets.push(t);
+      State.practiceTargets.push(t);
+    });
+
+    // Distance markers
+    [10,20,30,40].forEach(dist=>{
+      const geo=new THREE.PlaneGeometry(0.8,0.3);
+      const mat=new THREE.MeshBasicMaterial({color:0x39ff8f,transparent:true,opacity:0.7});
+      const m=new THREE.Mesh(geo,mat);
+      m.position.set(0,0.02,-dist);m.rotation.x=-Math.PI/2;
+      scene.add(m);
+    });
+
+    // Platform for the range
+    const platGeo=new THREE.BoxGeometry(60,0.2,40);
+    const platMat=new THREE.MeshLambertMaterial({color:0x2a3a4a});
+    const plat=new THREE.Mesh(platGeo,platMat);
+    plat.position.set(0,0.1,-15);plat.receiveShadow=true;
+    scene.add(plat);
+    PhysicsManager.createBoxBody(60,0.2,40,0,{x:0,y:0.1,z:-15},PhysicsManager.groundMat);
+
+    // Barriers
+    [-30,30].forEach(x=>{
+      const bGeo=new THREE.BoxGeometry(0.3,3,40);
+      const bMesh=new THREE.Mesh(bGeo,new THREE.MeshLambertMaterial({color:0x334455}));
+      bMesh.position.set(x,1.5,-15);
+      scene.add(bMesh);
+    });
+
+    State.practiceHits=0;State.practiceShots=0;
+    State.practiceStart=Date.now();
+    UIManager.showPracticeHUD(true);
+    this._timerInterval=setInterval(()=>UIManager.updatePracticeHUD(),500);
+  },
+
+  _makeTarget(x,z,moving){
+    const group=new THREE.Group();
+    // Post
+    const post=new THREE.Mesh(
+      new THREE.CylinderGeometry(0.06,0.06,2.2,8),
+      new THREE.MeshLambertMaterial({color:0x555555})
+    );
+    post.position.y=1.1;group.add(post);
+    // Board
+    const board=new THREE.Mesh(
+      new THREE.BoxGeometry(1.2,1.2,0.08),
+      new THREE.MeshLambertMaterial({color:0xffffff})
+    );
+    board.position.y=2.2;group.add(board);
+    // Rings
+    [0.55,0.4,0.25,0.12].forEach((r,i)=>{
+      const ring=new THREE.Mesh(
+        new THREE.CircleGeometry(r,20),
+        new THREE.MeshBasicMaterial({color:[0xff3333,0xffffff,0x3333ff,0xffcc00][i],side:THREE.DoubleSide})
+      );
+      ring.position.set(0,2.2,0.05+i*0.001);
+      group.add(ring);
+    });
+    group.position.set(x,0,z);
+    group.castShadow=true;
+    return{mesh:group,alive:true,x,z};
+  },
+
+  registerHit(target){
+    State.practiceHits++;
+    // Flash
+    target.mesh.traverse(c=>{
+      if(c.isMesh&&c.material&&c.material.color){
+        const orig=c.material.color.getHex();
+        c.material.color.setHex(0xffff00);
+        setTimeout(()=>c.material.color.setHex(orig),180);
+      }
+    });
+    UIManager.updatePracticeHUD();
+  },
+
+  update(t){
+    for(const target of this.targets){
+      if(!target.moving) continue;
+      const elapsed=t-State.practiceStart;
+      if(target.axis==='x'){
+        target.mesh.position.x=target.origin.x+Math.sin(elapsed*0.001*target.speed+target.phase)*target.range;
+      } else {
+        target.mesh.position.y=Math.sin(elapsed*0.001*target.speed+target.phase)*target.range*0.5;
+      }
     }
   },
 
-  _bindEvents() {
-    const s = this.socket;
+  cleanup(scene){
+    clearInterval(this._timerInterval);
+    for(const t of this.targets){scene.remove(t.mesh);}
+    this.targets=[];
+    State.practiceTargets=[];
+    UIManager.showPracticeHUD(false);
+  },
+};
 
-    s.on('connect', () => {
-      this.connected  = true;
-      State.localId   = s.id;
-      UIManager.setNetStatus(true);
-      // Announce ourselves
-      s.emit('join', { name: State.playerName, id: s.id });
+/* ═══════════════════════════════════════
+   NETWORK
+═══════════════════════════════════════ */
+const NetworkManager = {
+  socket:null,connected:false,_tick:0,
+
+  init(){
+    if(window.__socketStub){console.info('[Net] Offline mode');return;}
+    try{
+      this.socket=io(CONFIG.SERVER_URL,{transports:['websocket'],reconnection:true});
+      this._bind();
+    }catch(e){console.warn('[Net]',e);}
+  },
+
+  _bind(){
+    const s=this.socket;
+    s.on('connect',()=>{
+      this.connected=true;State.localId=s.id;UIManager.setNetStatus(true);
+      s.emit('join',{name:State.playerName,id:s.id,skin:State.equippedSkin});
     });
-
-    s.on('disconnect', () => {
-      this.connected = false;
-      UIManager.setNetStatus(false);
+    s.on('disconnect',()=>{this.connected=false;UIManager.setNetStatus(false);});
+    s.on('state',(data)=>{
+      (data.players||[]).forEach(p=>{if(p.id!==State.localId) this._addRemote(p);});
+      (data.structures||[]).forEach(b=>BuildingSystem.addRemote(b));
     });
-
-    // Receive existing room state
-    s.on('state', (data) => {
-      if (data.players) {
-        data.players.forEach(p => {
-          if (p.id !== State.localId) this._addRemotePlayer(p);
-        });
-      }
-      if (data.structures) {
-        data.structures.forEach(b => BuildingSystem.addRemote(b));
-      }
-    });
-
-    // Another player joins
-    s.on('player_joined', (p) => {
-      if (p.id === State.localId) return;
-      this._addRemotePlayer(p);
+    s.on('player_joined',(p)=>{
+      if(p.id===State.localId) return;
+      this._addRemote(p);
       UIManager.addKillFeed(`${p.name} joined`);
     });
-
-    // Player left
-    s.on('player_left', (data) => {
-      const p = State.players[data.id];
-      if (p) {
-        if (p.mesh) Game.scene.remove(p.mesh);
-        delete State.players[data.id];
-        UIManager.renderPlayerList();
-        UIManager.addKillFeed(`${p.name} left`);
-      }
+    s.on('player_left',(d)=>{
+      const p=State.players[d.id];
+      if(p){if(p.mesh) Game.scene.remove(p.mesh);delete State.players[d.id];UIManager.renderPlayerList();}
     });
-
-    // Position updates from other players
-    s.on('player_move', (data) => {
-      const p = State.players[data.id];
-      if (!p || !p.mesh) return;
-      p.mesh.position.set(data.x, data.y, data.z);
-      p.mesh.rotation.y = data.ry;
+    s.on('player_move',(d)=>{
+      const p=State.players[d.id];
+      if(p&&p.mesh){p.mesh.position.set(d.x,d.y,d.z);p.mesh.rotation.y=d.ry;}
     });
-
-    // Hit received
-    s.on('hit', (data) => {
-      CombatSystem.applyDamage(data.damage);
-    });
-
-    // Kill confirmation
-    s.on('kill', (data) => {
-      State.kills++;
-      UIManager.updateKills();
-      UIManager.addKillFeed(`${State.playerName} ↣ ${data.victimName}`);
+    s.on('hit',(d)=>{CombatSystem.applyDamage(d.damage);});
+    s.on('kill',(d)=>{
+      State.kills++;UIManager.updateKills();
+      UIManager.addKillFeed(`${State.playerName} > ${d.victimName}`);
       UIManager.showHitMarker();
     });
-
-    // Someone placed a building
-    s.on('build', (data) => {
-      BuildingSystem.addRemote(data);
-    });
-
-    // Admin broadcast (kick/ban notification)
-    s.on('kicked', (data) => {
-      if (data.id === State.localId) {
-        UIManager.showToast(`You were kicked: ${data.reason}`, 'error');
-        Game.returnToMenu();
-      }
+    s.on('build',(d)=>BuildingSystem.addRemote(d));
+    s.on('kicked',(d)=>{
+      if(d.id===State.localId){UIManager.showToast(`Kicked: ${d.reason}`,'error');Game.returnToMenu();}
     });
   },
 
-  _addRemotePlayer(p) {
-    const geo  = new THREE.BoxGeometry(0.7, 1.4, 0.5);
-    const mat  = new THREE.MeshLambertMaterial({ color: 0xcc3333 });
-    const mesh = new THREE.Mesh(geo, mat);
-    const headGeo  = new THREE.BoxGeometry(0.55, 0.55, 0.55);
-    const head     = new THREE.Mesh(headGeo, new THREE.MeshLambertMaterial({ color: 0xd4a96a }));
-    head.position.y = 1.05;
-    mesh.add(head);
-    if (p.x !== undefined) mesh.position.set(p.x, p.y, p.z);
+  _addRemote(p){
+    const mesh=ModelBuilder.buildPlayer(p.skin||'default',false);
+    if(p.x!==undefined) mesh.position.set(p.x,p.y,p.z);
     Game.scene.add(mesh);
-
-    State.players[p.id] = { name: p.name, mesh, health: CONFIG.MAX_HEALTH };
+    State.players[p.id]={name:p.name,mesh,health:CONFIG.MAX_HEALTH};
     UIManager.renderPlayerList();
   },
 
-  // ── Outbound messages ──
-  sendMove() {
-    if (!this.connected) return;
-    const pos = PlayerController.body.position;
-    this.socket.emit('move', {
-      x:  pos.x, y: pos.y, z: pos.z,
-      ry: PlayerController.camYaw,
-    });
+  sendMove(){
+    if(!this.connected) return;
+    const pos=PlayerController.body.position;
+    this.socket.emit('move',{x:pos.x,y:pos.y,z:pos.z,ry:PlayerController.camYaw});
   },
+  sendHit(d){if(this.connected) this.socket.emit('hit',d);},
+  sendBuild(d){if(this.connected) this.socket.emit('build',d);},
+  sendKick(id,reason){if(this.connected) this.socket.emit('admin_kick',{targetId:id,reason,adminId:State.localId});},
 
-  sendHit(data) {
-    if (!this.connected) return;
-    this.socket.emit('hit', data);
-  },
-
-  sendBuild(data) {
-    if (!this.connected) return;
-    this.socket.emit('build', data);
-  },
-
-  sendKick(targetId, reason) {
-    if (!this.connected) return;
-    this.socket.emit('admin_kick', { targetId, reason, adminId: State.localId });
-  },
-
-  tick(now) {
-    if (!this.connected) return;
-    if (now - this._tick > CONFIG.NET_TICK) {
-      this._tick = now;
-      this.sendMove();
-    }
+  tick(now){
+    if(!this.connected) return;
+    if(now-this._tick>CONFIG.NET_TICK){this._tick=now;this.sendMove();}
   },
 };
 
-/* ═══════════════════════════════════════════════════════════
-   SECTION 10 — ADMIN SYSTEM
-   ═══════════════════════════════════════════════════════════ */
-const AdminSystem = {
-  visible:  false,
-  unlocked: false,
+/* ═══════════════════════════════════════
+   SETTINGS SYSTEM
+═══════════════════════════════════════ */
+const SettingsSystem = {
+  BIND_LABELS:{
+    forward:'Move Forward',backward:'Move Backward',
+    left:'Strafe Left',right:'Strafe Right',
+    jump:'Jump',sprint:'Sprint',reload:'Reload',
+    build:'Toggle Build',wall:'Build Wall',
+    floor:'Build Floor',ramp:'Build Ramp',stair:'Build Stair',
+  },
 
-  init() {
-    const el = document.getElementById('adminConsole');
+  init(){
+    const sl=(id,key,valId)=>{
+      const el=document.getElementById(id);
+      if(!el) return;
+      el.value=CONFIG[key];
+      document.getElementById(valId).textContent=parseFloat(CONFIG[key]).toFixed(1);
+      el.addEventListener('input',()=>{document.getElementById(valId).textContent=parseFloat(el.value).toFixed(1);});
+    };
+    sl('sensSl','MOUSE_SENS','sensVal');
+    sl('adsSl','ADS_SENS','adsVal');
+    const fovEl=document.getElementById('fovSl');
+    if(fovEl){fovEl.value=CONFIG.FOV;document.getElementById('fovVal').textContent=CONFIG.FOV;fovEl.addEventListener('input',()=>{document.getElementById('fovVal').textContent=fovEl.value;});}
+    const invEl=document.getElementById('invertY');
+    if(invEl) invEl.checked=CONFIG.INVERT_Y;
+    const shEl=document.getElementById('shadows');
+    if(shEl) shEl.checked=Game.renderer&&Game.renderer.shadowMap.enabled;
 
-    document.getElementById('btnAdminAuth').addEventListener('click', () => this.tryAuth());
-    document.getElementById('adminPassInput').addEventListener('keydown', e => {
-      if (e.code === 'Enter') this.tryAuth();
+    this.renderKeybinds();
+
+    document.getElementById('btnSaveSettings').addEventListener('click',()=>this.save());
+    document.getElementById('btnResetSettings').addEventListener('click',()=>this.reset());
+    document.getElementById('btnBackSettings').addEventListener('click',()=>{
+      UIManager.hideScreen('settingsScreen');
+      if(State.phase==='menu') UIManager.showScreen('mainMenu');
+      else UIManager.showScreen('pauseMenu');
     });
+    document.getElementById('btnCancelRebind').addEventListener('click',()=>{
+      Input._rebinding=null;
+      document.getElementById('rebindModal').classList.add('hidden');
+    });
+  },
 
-    document.getElementById('btnAdminClose').addEventListener('click', () => this.hide());
-    document.getElementById('btnAdminLock').addEventListener('click',  () => this.lock());
+  renderKeybinds(){
+    const grid=document.getElementById('keybindsGrid');
+    if(!grid) return;
+    grid.innerHTML='';
+    for(const action in this.BIND_LABELS){
+      const row=document.createElement('div');row.className='kb-row';
+      const lbl=document.createElement('span');lbl.className='kb-action';lbl.textContent=this.BIND_LABELS[action];
+      const key=document.createElement('span');key.className='kb-key';
+      key.textContent=this._displayKey(State.binds[action]);
+      key.dataset.action=action;
+      key.addEventListener('click',()=>this.startRebind(action,key));
+      row.appendChild(lbl);row.appendChild(key);
+      grid.appendChild(row);
+    }
+  },
 
-    // Tabs
-    document.querySelectorAll('.admin-tab').forEach(btn => {
-      btn.addEventListener('click', () => {
-        document.querySelectorAll('.admin-tab').forEach(b => b.classList.remove('active'));
-        document.querySelectorAll('.admin-tab-content').forEach(c => c.classList.add('hidden'));
+  startRebind(action,keyEl){
+    document.getElementById('rebindAction').textContent=this.BIND_LABELS[action];
+    document.getElementById('rebindModal').classList.remove('hidden');
+    keyEl.classList.add('listening');
+    keyEl.textContent='...';
+    Input.startRebind(action,(code)=>{
+      document.getElementById('rebindModal').classList.add('hidden');
+      keyEl.classList.remove('listening');
+      keyEl.textContent=this._displayKey(code);
+    });
+  },
+
+  _displayKey(code){
+    if(!code) return '—';
+    return code.replace('Key','').replace('Digit','').replace('Arrow','').replace('Left','L').replace('Right','R');
+  },
+
+  save(){
+    const sens=parseFloat(document.getElementById('sensSl').value);
+    const ads=parseFloat(document.getElementById('adsSl').value);
+    const fov=parseInt(document.getElementById('fovSl').value);
+    const inv=document.getElementById('invertY').checked;
+    const shad=document.getElementById('shadows').checked;
+    CONFIG.MOUSE_SENS=sens;CONFIG.ADS_SENS=ads;CONFIG.FOV=fov;CONFIG.INVERT_Y=inv;
+    if(Game.renderer) Game.renderer.shadowMap.enabled=shad;
+    if(Game.camera){Game.camera.fov=fov;Game.camera.updateProjectionMatrix();}
+    StorageManager.saveSettings({sens,adsSens:ads,fov,invertY:inv,binds:{...State.binds}});
+    UIManager.showToast('Settings saved!','success');
+  },
+
+  reset(){
+    State.binds={...DEFAULT_BINDS};
+    CONFIG.MOUSE_SENS=3;CONFIG.ADS_SENS=1.5;CONFIG.FOV=75;CONFIG.INVERT_Y=false;
+    document.getElementById('sensSl').value=3;document.getElementById('sensVal').textContent='3.0';
+    document.getElementById('adsSl').value=1.5;document.getElementById('adsVal').textContent='1.5';
+    document.getElementById('fovSl').value=75;document.getElementById('fovVal').textContent='75';
+    document.getElementById('invertY').checked=false;
+    this.renderKeybinds();
+    UIManager.showToast('Settings reset to defaults','success');
+  },
+};
+
+/* ═══════════════════════════════════════
+   SKINS SYSTEM
+═══════════════════════════════════════ */
+const SkinsSystem = {
+  init(){
+    this.renderGrid();
+    document.getElementById('btnEquipSkin').addEventListener('click',()=>{
+      State.equippedSkin=State.selectedSkin;
+      StorageManager.saveSkin(State.equippedSkin);
+      UIManager.showToast(`Skin equipped: ${SKINS.find(s=>s.id===State.equippedSkin).name}`,'success');
+      document.querySelectorAll('.skin-card').forEach(c=>c.classList.toggle('equipped',c.dataset.id===State.equippedSkin));
+    });
+    document.getElementById('btnBackSkins').addEventListener('click',()=>{
+      UIManager.hideScreen('skinsScreen');UIManager.showScreen('mainMenu');
+    });
+  },
+
+  renderGrid(){
+    const grid=document.getElementById('skinsGrid');
+    if(!grid) return;
+    grid.innerHTML='';
+    SKINS.forEach(skin=>{
+      const card=document.createElement('div');
+      card.className='skin-card'+(State.selectedSkin===skin.id?' selected':'')+(State.equippedSkin===skin.id?' equipped':'');
+      card.dataset.id=skin.id;
+      // Color swatch
+      const swatch=document.createElement('div');swatch.className='skin-swatch';
+      swatch.style.cssText=`background:#${skin.body.toString(16).padStart(6,'0')};border-radius:4px`;
+      const head=document.createElement('div');head.className='skin-swatch-head';
+      head.style.cssText=`background:#${skin.head.toString(16).padStart(6,'0')};width:24px;height:24px;border-radius:50%;margin:0 auto 4px`;
+      swatch.appendChild(head);
+      const lbl=document.createElement('div');lbl.className='skin-name';lbl.textContent=skin.name;
+      if(State.equippedSkin===skin.id){
+        const eq=document.createElement('div');eq.style.cssText='font-size:.58rem;color:var(--accent2);letter-spacing:.1em;margin-top:2px';
+        eq.textContent='EQUIPPED';card.appendChild(eq);
+      }
+      card.appendChild(swatch);card.appendChild(lbl);
+      card.addEventListener('click',()=>{
+        State.selectedSkin=skin.id;
+        document.querySelectorAll('.skin-card').forEach(c=>c.classList.remove('selected'));
+        card.classList.add('selected');
+        document.getElementById('skinPreviewName').textContent=skin.name;
+        this.drawPreview(skin);
+      });
+      grid.appendChild(card);
+    });
+    this.drawPreview(SKINS.find(s=>s.id===State.selectedSkin)||SKINS[0]);
+  },
+
+  drawPreview(skin){
+    const canvas=document.getElementById('skinPreviewCanvas');
+    if(!canvas) return;
+    const ctx=canvas.getContext('2d');
+    const W=canvas.width,H=canvas.height;
+    ctx.clearRect(0,0,W,H);
+    ctx.fillStyle='rgba(255,255,255,0.02)';ctx.fillRect(0,0,W,H);
+
+    const bodyC='#'+skin.body.toString(16).padStart(6,'0');
+    const headC='#'+skin.head.toString(16).padStart(6,'0');
+    const legC ='#'+skin.legs.toString(16).padStart(6,'0');
+
+    // Draw simple character front-view
+    const cx=W/2,top=20;
+    // Head
+    ctx.fillStyle=headC;ctx.fillRect(cx-22,top,44,40);
+    // Eyes
+    ctx.fillStyle='#111122';ctx.fillRect(cx-14,top+14,10,8);ctx.fillRect(cx+4,top+14,10,8);
+    // Helmet
+    ctx.fillStyle='rgba(0,0,0,0.4)';ctx.fillRect(cx-22,top+10,44,12);
+    // Torso
+    ctx.fillStyle=bodyC;ctx.fillRect(cx-28,top+44,56,52);
+    // Belt
+    ctx.fillStyle='rgba(0,0,0,0.35)';ctx.fillRect(cx-28,top+88,56,6);
+    // Arms
+    ctx.fillStyle=bodyC;
+    ctx.fillRect(cx-46,top+46,16,48);// left
+    ctx.fillRect(cx+30,top+46,16,48);// right
+    // Hands
+    ctx.fillStyle=headC;
+    ctx.fillRect(cx-46,top+90,16,16);ctx.fillRect(cx+30,top+90,16,16);
+    // Legs
+    ctx.fillStyle=legC;
+    ctx.fillRect(cx-28,top+97,24,60);ctx.fillRect(cx+4,top+97,24,60);
+    // Feet
+    ctx.fillStyle='#111';
+    ctx.fillRect(cx-30,top+154,28,14);ctx.fillRect(cx+2,top+154,28,14);
+    // Backpack hint
+    ctx.fillStyle=legC;ctx.globalAlpha=0.5;ctx.fillRect(cx+28,top+46,8,44);ctx.globalAlpha=1;
+  },
+};
+
+/* ═══════════════════════════════════════
+   ADMIN SYSTEM
+═══════════════════════════════════════ */
+const AdminSystem = {
+  visible:false,unlocked:false,
+
+  init(){
+    document.getElementById('btnAdminAuth').addEventListener('click',()=>this.tryAuth());
+    document.getElementById('adminPassInput').addEventListener('keydown',e=>{if(e.code==='Enter') this.tryAuth();});
+    document.getElementById('btnAdminClose').addEventListener('click',()=>this.hide());
+    document.getElementById('btnAdminLock').addEventListener('click',()=>this.lock());
+    document.querySelectorAll('.admin-tab').forEach(btn=>{
+      btn.addEventListener('click',()=>{
+        document.querySelectorAll('.admin-tab').forEach(b=>b.classList.remove('active'));
+        document.querySelectorAll('.admin-tab-content').forEach(c=>c.classList.add('hidden'));
         btn.classList.add('active');
         document.getElementById(`adminTab-${btn.dataset.tab}`).classList.remove('hidden');
-
-        if (btn.dataset.tab === 'players')  this.renderPlayers();
-        if (btn.dataset.tab === 'bans')     this.renderBans();
-        if (btn.dataset.tab === 'reports')  this.renderReports();
+        if(btn.dataset.tab==='players') this.renderPlayers();
+        if(btn.dataset.tab==='bans') this.renderBans();
+        if(btn.dataset.tab==='reports') this.renderReports();
       });
     });
-
-    document.getElementById('btnAddBan').addEventListener('click', () => this.addBan());
-    document.getElementById('btnClearReports').addEventListener('click', () => {
-      State.reports = [];
-      StorageManager.saveReports();
-      this.renderReports();
-    });
-    document.getElementById('btnSaveConfig').addEventListener('click', () => this.saveConfig());
+    document.getElementById('btnAddBan').addEventListener('click',()=>this.addBan());
+    document.getElementById('btnClearReports').addEventListener('click',()=>{State.reports=[];StorageManager.saveReports();this.renderReports();});
+    document.getElementById('btnSaveConfig').addEventListener('click',()=>this.saveConfig());
   },
 
-  toggleConsole() {
-    this.visible ? this.hide() : this.show();
-  },
+  toggleConsole(){this.visible?this.hide():this.show();},
 
-  show() {
-    this.visible = true;
+  show(){
+    this.visible=true;
     document.getElementById('adminConsole').classList.remove('hidden');
-    Input.releasePointerLock();
-    if (!this.unlocked) {
-      document.getElementById('adminPassInput').focus();
-    }
+    Input.releaseLock();
+    if(!this.unlocked) document.getElementById('adminPassInput').focus();
     this.renderPlayers();
   },
-
-  hide() {
-    this.visible = false;
+  hide(){
+    this.visible=false;
     document.getElementById('adminConsole').classList.add('hidden');
-    if (State.phase === 'playing') Input.requestPointerLock();
+    if(State.phase==='playing'||State.phase==='practice') Input.requestLock();
   },
-
-  tryAuth() {
-    const pass = document.getElementById('adminPassInput').value;
-    const msg  = document.getElementById('adminAuthMsg');
-    if (pass === CONFIG.ADMIN_PASSWORD) {
-      this.unlocked   = true;
-      State.isAdmin   = true;
+  tryAuth(){
+    const pass=document.getElementById('adminPassInput').value;
+    const msg=document.getElementById('adminAuthMsg');
+    if(pass===CONFIG.ADMIN_PASSWORD){
+      this.unlocked=true;State.isAdmin=true;
       document.getElementById('adminLock').classList.add('hidden');
       document.getElementById('adminPanel').classList.remove('hidden');
-      msg.textContent = '';
-      this.renderPlayers();
-      this.loadConfig();
+      msg.textContent='';this.renderPlayers();this.loadConfig();
     } else {
-      msg.textContent = '✕ Incorrect password.';
-      msg.className   = 'admin-msg err';
-      document.getElementById('adminPassInput').value = '';
+      msg.textContent='Incorrect password.';msg.className='admin-msg err';
+      document.getElementById('adminPassInput').value='';
     }
   },
-
-  lock() {
-    this.unlocked = false;
-    State.isAdmin = false;
+  lock(){
+    this.unlocked=false;State.isAdmin=false;
     document.getElementById('adminPanel').classList.add('hidden');
     document.getElementById('adminLock').classList.remove('hidden');
-    document.getElementById('adminPassInput').value = '';
-    document.getElementById('adminAuthMsg').textContent = '';
+    document.getElementById('adminPassInput').value='';
+    document.getElementById('adminAuthMsg').textContent='';
   },
-
-  renderPlayers() {
-    const list = document.getElementById('adminPlayerList');
-    list.innerHTML = '';
-
-    // Local player
-    const localEntry = this._playerEntry(State.localId || 'local', State.playerName + ' (you)', false);
-    list.appendChild(localEntry);
-
-    // Remote players
-    for (const id in State.players) {
-      const p = State.players[id];
-      const entry = this._playerEntry(id, p.name, true);
-      list.appendChild(entry);
-    }
-
-    if (!list.children.length) {
-      list.innerHTML = '<p style="color:var(--text-dim);font-size:.75rem;padding:8px 0">No other players online.</p>';
-    }
+  renderPlayers(){
+    const list=document.getElementById('adminPlayerList');list.innerHTML='';
+    list.appendChild(this._entry(State.localId||'local',State.playerName+' (you)',false));
+    for(const id in State.players) list.appendChild(this._entry(id,State.players[id].name,true));
   },
-
-  _playerEntry(id, name, canAction) {
-    const div = document.createElement('div');
-    div.className = 'admin-entry';
-    div.innerHTML = `
-      <span class="admin-entry-name">${this._esc(name)}</span>
-      <span class="admin-entry-id">${this._esc(id)}</span>
-      ${canAction ? `
-        <button class="btn-danger" data-action="kick" data-id="${this._esc(id)}" data-name="${this._esc(name)}">KICK</button>
-        <button class="btn-danger" data-action="ban"  data-id="${this._esc(id)}" data-name="${this._esc(name)}">BAN</button>
-      ` : ''}
-    `;
-    div.querySelectorAll('[data-action]').forEach(btn => {
-      btn.addEventListener('click', () => {
-        const action = btn.dataset.action;
-        const pid    = btn.dataset.id;
-        const pname  = btn.dataset.name;
-        const reason = prompt(`Reason to ${action} ${pname}?`) || 'No reason given';
-        if (action === 'kick') this.kickPlayer(pid, pname, reason);
-        if (action === 'ban')  this.banPlayer(pid, pname, reason);
+  _entry(id,name,canAct){
+    const div=document.createElement('div');div.className='admin-entry';
+    div.innerHTML=`<span class="admin-entry-name">${this._e(name)}</span><span class="admin-entry-id">${this._e(id)}</span>
+    ${canAct?`<button class="btn-danger" data-a="kick" data-id="${this._e(id)}" data-n="${this._e(name)}">KICK</button>
+    <button class="btn-danger" data-a="ban" data-id="${this._e(id)}" data-n="${this._e(name)}">BAN</button>`:''}`;
+    div.querySelectorAll('[data-a]').forEach(btn=>{
+      btn.addEventListener('click',()=>{
+        const r=prompt(`Reason to ${btn.dataset.a} ${btn.dataset.n}?`)||'No reason';
+        if(btn.dataset.a==='kick') this.kick(btn.dataset.id,btn.dataset.n,r);
+        if(btn.dataset.a==='ban')  this.ban(btn.dataset.id,btn.dataset.n,r);
       });
     });
     return div;
   },
-
-  kickPlayer(id, name, reason) {
-    NetworkManager.sendKick(id, reason);
-    UIManager.showToast(`Kicked: ${name}`, 'success');
-    this.renderPlayers();
+  kick(id,name,reason){NetworkManager.sendKick(id,reason);UIManager.showToast(`Kicked: ${name}`,'success');this.renderPlayers();},
+  ban(id,name,reason){
+    if(!State.bannedIds.find(b=>b.id===id)) State.bannedIds.push({id,name,reason,date:new Date().toISOString()});
+    StorageManager.saveBans();this.kick(id,name,`Banned: ${reason}`);this.renderBans();
   },
-
-  banPlayer(id, name, reason) {
-    if (!State.bannedIds.find(b => b.id === id)) {
-      State.bannedIds.push({ id, name, reason, date: new Date().toISOString() });
-      StorageManager.saveBans();
-    }
-    this.kickPlayer(id, name, `Banned: ${reason}`);
-    this.renderBans();
-  },
-
-  unbanPlayer(id) {
-    State.bannedIds = State.bannedIds.filter(b => b.id !== id);
-    StorageManager.saveBans();
-    this.renderBans();
-    UIManager.showToast('Player unbanned.', 'success');
-  },
-
-  renderBans() {
-    const list = document.getElementById('adminBanList');
-    list.innerHTML = '';
-    if (!State.bannedIds.length) {
-      list.innerHTML = '<p style="color:var(--text-dim);font-size:.75rem;padding:8px 0">No banned players.</p>';
-      return;
-    }
-    State.bannedIds.forEach(b => {
-      const div = document.createElement('div');
-      div.className = 'admin-entry';
-      div.innerHTML = `
-        <span class="admin-entry-name">${this._esc(b.name)}</span>
-        <span class="admin-entry-id">${this._esc(b.reason)}</span>
-        <button class="btn-danger" data-id="${this._esc(b.id)}">UNBAN</button>
-      `;
-      div.querySelector('[data-id]').addEventListener('click', () => this.unbanPlayer(b.id));
+  unban(id){State.bannedIds=State.bannedIds.filter(b=>b.id!==id);StorageManager.saveBans();this.renderBans();UIManager.showToast('Unbanned','success');},
+  renderBans(){
+    const list=document.getElementById('adminBanList');list.innerHTML='';
+    if(!State.bannedIds.length){list.innerHTML='<p style="color:var(--text-dim);font-size:.75rem;padding:8px 0">No bans.</p>';return;}
+    State.bannedIds.forEach(b=>{
+      const div=document.createElement('div');div.className='admin-entry';
+      div.innerHTML=`<span class="admin-entry-name">${this._e(b.name)}</span><span class="admin-entry-id">${this._e(b.reason)}</span><button class="btn-danger" data-id="${this._e(b.id)}">UNBAN</button>`;
+      div.querySelector('[data-id]').addEventListener('click',()=>this.unban(b.id));
       list.appendChild(div);
     });
   },
-
-  renderReports() {
-    const list = document.getElementById('adminReportList');
-    list.innerHTML = '';
-    if (!State.reports.length) {
-      list.innerHTML = '<p style="color:var(--text-dim);font-size:.75rem;padding:8px 0">No reports filed.</p>';
-      return;
-    }
-    State.reports.forEach((r, i) => {
-      const div = document.createElement('div');
-      div.className = 'admin-entry';
-      div.style.flexDirection = 'column';
-      div.style.alignItems    = 'flex-start';
-      div.innerHTML = `
-        <strong style="color:var(--accent3)">${this._esc(r.reporter)} → ${this._esc(r.target)}</strong>
-        <span style="color:var(--text-dim);font-size:.72rem">${this._esc(r.reason)}: ${this._esc(r.details || '')}</span>
-        <span style="color:var(--text-dim);font-size:.65rem">${new Date(r.date).toLocaleString()}</span>
-      `;
+  renderReports(){
+    const list=document.getElementById('adminReportList');list.innerHTML='';
+    if(!State.reports.length){list.innerHTML='<p style="color:var(--text-dim);font-size:.75rem;padding:8px 0">No reports.</p>';return;}
+    State.reports.forEach(r=>{
+      const div=document.createElement('div');div.className='admin-entry';div.style.flexDirection='column';div.style.alignItems='flex-start';
+      div.innerHTML=`<strong style="color:var(--accent3)">${this._e(r.reporter)} → ${this._e(r.target)}</strong>
+      <span style="color:var(--text-dim);font-size:.7rem">${this._e(r.reason)}: ${this._e(r.details||'')}</span>
+      <span style="color:var(--text-dim);font-size:.62rem">${new Date(r.date).toLocaleString()}</span>`;
       list.appendChild(div);
     });
   },
-
-  addBan() {
-    const id     = document.getElementById('banIdInput').value.trim();
-    const reason = document.getElementById('banReasonInput').value.trim();
-    if (!id) return;
-    this.banPlayer(id, id, reason || 'Manual ban');
-    document.getElementById('banIdInput').value     = '';
-    document.getElementById('banReasonInput').value = '';
+  addBan(){
+    const id=document.getElementById('banIdInput').value.trim();
+    const reason=document.getElementById('banReasonInput').value.trim();
+    if(!id) return;
+    this.ban(id,id,reason||'Manual ban');
+    document.getElementById('banIdInput').value='';document.getElementById('banReasonInput').value='';
   },
-
-  loadConfig() {
-    document.getElementById('cfgServer').value  = CONFIG.SERVER_URL  || '';
-    document.getElementById('cfgWebhook').value = CONFIG.DISCORD_WEBHOOK || '';
+  loadConfig(){
+    document.getElementById('cfgServer').value=CONFIG.SERVER_URL||'';
+    document.getElementById('cfgWebhook').value=CONFIG.DISCORD_WEBHOOK||'';
   },
-
-  saveConfig() {
-    const server  = document.getElementById('cfgServer').value.trim();
-    const webhook = document.getElementById('cfgWebhook').value.trim();
-    const newPass = document.getElementById('cfgNewPass').value.trim();
-    const msg     = document.getElementById('cfgMsg');
-
-    const cfg = {};
-    if (server)  { CONFIG.SERVER_URL = server;          cfg.serverUrl = server; }
-    if (webhook) { CONFIG.DISCORD_WEBHOOK = webhook;    cfg.discordWebhook = webhook; }
-    if (newPass) { CONFIG.ADMIN_PASSWORD  = newPass;    cfg.adminPassword  = newPass; }
-
+  saveConfig(){
+    const server=document.getElementById('cfgServer').value.trim();
+    const webhook=document.getElementById('cfgWebhook').value.trim();
+    const newPass=document.getElementById('cfgNewPass').value.trim();
+    const cfg={};
+    if(server){CONFIG.SERVER_URL=server;cfg.serverUrl=server;}
+    if(webhook){CONFIG.DISCORD_WEBHOOK=webhook;cfg.discordWebhook=webhook;}
+    if(newPass){CONFIG.ADMIN_PASSWORD=newPass;cfg.adminPassword=newPass;}
     StorageManager.saveConfig(cfg);
-    msg.textContent = '✓ Configuration saved.';
-    msg.className   = 'admin-msg ok';
-    document.getElementById('cfgNewPass').value = '';
+    document.getElementById('cfgMsg').textContent='Saved.';document.getElementById('cfgMsg').className='admin-msg ok';
+    document.getElementById('cfgNewPass').value='';
   },
-
-  _esc(s) {
-    return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-  },
+  _e(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 };
 
-/* ═══════════════════════════════════════════════════════════
-   SECTION 11 — REPORT SYSTEM
-   ═══════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════
+   REPORT SYSTEM
+═══════════════════════════════════════ */
 const ReportSystem = {
-  init() {
-    document.getElementById('btnReport').addEventListener('click', () => this.openModal());
-    document.getElementById('btnSubmitReport').addEventListener('click', () => this.submit());
-    document.getElementById('btnCancelReport').addEventListener('click', () => this.closeModal());
+  init(){
+    document.getElementById('btnReport').addEventListener('click',()=>this.open());
+    document.getElementById('btnSubmitReport').addEventListener('click',()=>this.submit());
+    document.getElementById('btnCancelReport').addEventListener('click',()=>this.close());
   },
-
-  openModal() {
-    // Populate player select
-    const sel = document.getElementById('reportTarget');
-    sel.innerHTML = '<option value="">-- Choose player --</option>';
-    for (const id in State.players) {
-      const opt = document.createElement('option');
-      opt.value       = id;
-      opt.textContent = State.players[id].name;
-      sel.appendChild(opt);
+  open(){
+    const sel=document.getElementById('reportTarget');
+    sel.innerHTML='<option value="">-- Select --</option>';
+    for(const id in State.players){
+      const o=document.createElement('option');o.value=id;o.textContent=State.players[id].name;sel.appendChild(o);
     }
     document.getElementById('reportModal').classList.remove('hidden');
-    if (Input.locked) Input.releasePointerLock();
+    if(Input.locked) Input.releaseLock();
   },
-
-  closeModal() {
+  close(){
     document.getElementById('reportModal').classList.add('hidden');
-    document.getElementById('reportDetails').value = '';
-    if (State.phase === 'playing') Input.requestPointerLock();
+    document.getElementById('reportDetails').value='';
+    if(State.phase==='playing'||State.phase==='practice') Input.requestLock();
   },
-
-  async submit() {
-    const targetId  = document.getElementById('reportTarget').value;
-    const reason    = document.getElementById('reportReason').value;
-    const details   = document.getElementById('reportDetails').value.trim();
-
-    if (!targetId) {
-      UIManager.showToast('Please select a player to report.', 'error');
-      return;
+  async submit(){
+    const targetId=document.getElementById('reportTarget').value;
+    const reason=document.getElementById('reportReason').value;
+    const details=document.getElementById('reportDetails').value.trim();
+    if(!targetId){UIManager.showToast('Select a player to report','error');return;}
+    const target=State.players[targetId];
+    const report={reporter:State.playerName,target:target?target.name:targetId,targetId,reason,details,date:new Date().toISOString()};
+    State.reports.push(report);StorageManager.saveReports();
+    if(CONFIG.DISCORD_WEBHOOK&&CONFIG.DISCORD_WEBHOOK!=='YOUR_WEBHOOK_HERE'){
+      try{await fetch(CONFIG.DISCORD_WEBHOOK,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({embeds:[{title:'GunzML Report',color:0xff3333,fields:[{name:'Reporter',value:report.reporter,inline:true},{name:'Reported',value:report.target,inline:true},{name:'Reason',value:reason,inline:true},{name:'Details',value:details||'N/A'}]}]})});}catch(_){}
     }
-
-    const target = State.players[targetId];
-    const report = {
-      reporter: State.playerName,
-      target:   target ? target.name : targetId,
-      targetId,
-      reason,
-      details,
-      date:    new Date().toISOString(),
-    };
-
-    State.reports.push(report);
-    StorageManager.saveReports();
-
-    // Send to Discord webhook if configured
-    if (CONFIG.DISCORD_WEBHOOK && CONFIG.DISCORD_WEBHOOK !== 'YOUR_DISCORD_WEBHOOK_URL_HERE') {
-      await this._sendToDiscord(report);
-    }
-
-    this.closeModal();
-    UIManager.showToast('Report submitted. Thank you.', 'success');
-  },
-
-  async _sendToDiscord(report) {
-    try {
-      const embed = {
-        title:       '⚑ GunzML — Player Report',
-        color:       0xff3333,
-        fields: [
-          { name: 'Reporter',  value: report.reporter, inline: true },
-          { name: 'Reported',  value: report.target,   inline: true },
-          { name: 'Reason',    value: report.reason,   inline: true },
-          { name: 'Details',   value: report.details || 'N/A' },
-          { name: 'Timestamp', value: new Date(report.date).toUTCString() },
-        ],
-      };
-      await fetch(CONFIG.DISCORD_WEBHOOK, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ embeds: [embed] }),
-      });
-    } catch (e) {
-      console.warn('[Report] Discord webhook failed:', e);
-    }
+    this.close();UIManager.showToast('Report submitted. Thank you.','success');
   },
 };
 
-/* ═══════════════════════════════════════════════════════════
-   SECTION 12 — UI MANAGER
-   ═══════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════
+   UI MANAGER
+═══════════════════════════════════════ */
 const UIManager = {
-  _hitTimeout:    null,
-  _damageTimeout: null,
+  _hitTO:null,_dmgTO:null,
 
-  init() {
-    // Main menu buttons
-    document.getElementById('btnPlay').addEventListener('click', () => {
-      const name = document.getElementById('playerNameInput').value.trim() || 'Operator';
-      State.playerName = name;
-      StorageManager.saveName(name);
-      Game.startGame();
+  init(){
+    document.getElementById('btnPlay').addEventListener('click',()=>{
+      const n=document.getElementById('playerNameInput').value.trim()||'Operator';
+      State.playerName=n;StorageManager.saveName(n);
+      Game.startGame(false,false);
     });
-    document.getElementById('btnMultiplayer').addEventListener('click', () => {
-      const name = document.getElementById('playerNameInput').value.trim() || 'Operator';
-      State.playerName = name;
-      StorageManager.saveName(name);
-      Game.startGame(true);
+    document.getElementById('btnPractice').addEventListener('click',()=>{
+      const n=document.getElementById('playerNameInput').value.trim()||'Operator';
+      State.playerName=n;StorageManager.saveName(n);
+      Game.startGame(false,true);
     });
-    document.getElementById('btnControls').addEventListener('click', () => {
-      this.hideScreen('mainMenu');
-      this.showScreen('controlsScreen');
+    document.getElementById('btnSettings').addEventListener('click',()=>{
+      this.hideScreen('mainMenu');this.showScreen('settingsScreen');
     });
-    document.getElementById('btnBackControls').addEventListener('click', () => {
-      this.hideScreen('controlsScreen');
-      this.showScreen('mainMenu');
+    document.getElementById('btnSkins').addEventListener('click',()=>{
+      this.hideScreen('mainMenu');this.showScreen('skinsScreen');
+      SkinsSystem.renderGrid();
     });
-
-    // Pause
-    document.getElementById('btnResume').addEventListener('click', () => this.resumeGame());
-    document.getElementById('btnQuit').addEventListener('click',   () => Game.returnToMenu());
-
-    // Death
-    document.getElementById('btnRespawn').addEventListener('click', () => {
-      PlayerController.respawn();
-      this.hideScreen('deathScreen');
+    document.getElementById('btnControls').addEventListener('click',()=>{
+      this.hideScreen('mainMenu');this.showScreen('controlsScreen');
     });
-    document.getElementById('btnDeathQuit').addEventListener('click', () => Game.returnToMenu());
-
-    // Pre-fill name
-    document.getElementById('playerNameInput').value = State.playerName;
-
-    // Build type click from banner
-    document.querySelectorAll('.btype').forEach(el => {
-      el.addEventListener('click', () => BuildingSystem.setType(el.dataset.type));
+    document.getElementById('btnBackControls').addEventListener('click',()=>{
+      this.hideScreen('controlsScreen');this.showScreen('mainMenu');
     });
+    document.getElementById('btnResume').addEventListener('click',()=>this.resumeGame());
+    document.getElementById('btnPauseSettings').addEventListener('click',()=>{
+      this.hideScreen('pauseMenu');this.showScreen('settingsScreen');
+    });
+    document.getElementById('btnQuit').addEventListener('click',()=>Game.returnToMenu());
+    document.getElementById('btnRespawn').addEventListener('click',()=>{PlayerController.respawn();});
+    document.getElementById('btnDeathQuit').addEventListener('click',()=>Game.returnToMenu());
+    document.getElementById('btnExitPractice').addEventListener('click',()=>Game.returnToMenu());
+    document.getElementById('playerNameInput').value=State.playerName;
   },
 
-  showScreen(id) {
-    const el = document.getElementById(id);
-    if (el) el.classList.remove('hidden');
-  },
-  hideScreen(id) {
-    const el = document.getElementById(id);
-    if (el) el.classList.add('hidden');
-  },
+  showScreen(id){const e=document.getElementById(id);if(e) e.classList.remove('hidden');},
+  hideScreen(id){const e=document.getElementById(id);if(e) e.classList.add('hidden');},
+  showHUD(v){const h=document.getElementById('hud');v?h.classList.remove('hidden'):h.classList.add('hidden');},
+  showPause(){State.phase='paused';this.showScreen('pauseMenu');Input.releaseLock();},
+  resumeGame(){State.phase='playing';this.hideScreen('pauseMenu');Input.requestLock();},
 
-  showHUD(show) {
-    const hud = document.getElementById('hud');
-    if (show) hud.classList.remove('hidden');
-    else      hud.classList.add('hidden');
-  },
-
-  showPause() {
-    State.phase = 'paused';
-    this.showScreen('pauseMenu');
-    Input.releasePointerLock();
+  showDeath(killer){
+    document.getElementById('deathMsg').textContent=`Eliminated by ${killer}`;
+    document.getElementById('deathKills').textContent=State.kills;
+    document.getElementById('deathShots').textContent=State.shots;
+    const acc=State.shots>0?Math.round(State.hits/State.shots*100):0;
+    document.getElementById('deathAcc').textContent=acc+'%';
+    this.showScreen('deathScreen');Input.releaseLock();
   },
 
-  resumeGame() {
-    State.phase = 'playing';
-    this.hideScreen('pauseMenu');
-    Input.requestPointerLock();
+  updateHealth(){
+    const pct=(State.health/CONFIG.MAX_HEALTH)*100;
+    document.getElementById('healthFill').style.width=pct+'%';
+    document.getElementById('healthVal').textContent=State.health;
+    const f=document.getElementById('healthFill');
+    f.style.background=State.health>50?'var(--accent2)':State.health>25?'var(--accent)':'var(--danger)';
   },
 
-  showDeath(killerName) {
-    document.getElementById('deathMsg').textContent = `Eliminated by ${killerName}.`;
-    this.showScreen('deathScreen');
-    Input.releasePointerLock();
+  updateAmmo(){
+    document.getElementById('ammoCount').textContent=State.ammo;
+    document.getElementById('ammoReserve').textContent=State.reserveAmmo;
   },
 
-  updateHealth() {
-    const pct = (State.health / CONFIG.MAX_HEALTH) * 100;
-    document.getElementById('healthFill').style.width = pct + '%';
-    document.getElementById('healthVal').textContent  = State.health;
+  updateKills(){document.getElementById('killCount').textContent=State.kills;},
 
-    const fill = document.getElementById('healthFill');
-    if (State.health > 50)      fill.style.background = 'var(--accent2)';
-    else if (State.health > 25) fill.style.background = 'var(--accent)';
-    else                        fill.style.background = 'var(--danger)';
+  showHitMarker(){
+    const e=document.getElementById('hitMarker');
+    e.classList.remove('hidden');
+    clearTimeout(this._hitTO);
+    this._hitTO=setTimeout(()=>e.classList.add('hidden'),220);
   },
 
-  updateAmmo() {
-    document.getElementById('ammoCount').textContent   = State.ammo;
-    document.getElementById('ammoReserve').textContent = State.reserveAmmo;
+  flashDamage(){
+    document.body.style.boxShadow='inset 0 0 70px rgba(255,0,0,0.45)';
+    clearTimeout(this._dmgTO);
+    this._dmgTO=setTimeout(()=>{document.body.style.boxShadow='';},280);
   },
 
-  updateKills() {
-    document.getElementById('killCount').textContent = State.kills;
-  },
-
-  showHitMarker() {
-    const el = document.getElementById('hitMarker');
-    el.classList.remove('hidden');
-    clearTimeout(this._hitTimeout);
-    this._hitTimeout = setTimeout(() => el.classList.add('hidden'), 250);
-  },
-
-  flashDamage() {
-    document.body.style.boxShadow = 'inset 0 0 60px rgba(255,0,0,0.4)';
-    clearTimeout(this._damageTimeout);
-    this._damageTimeout = setTimeout(() => {
-      document.body.style.boxShadow = '';
-    }, 300);
-  },
-
-  addKillFeed(text) {
-    const feed = document.getElementById('killFeed');
-    const el   = document.createElement('div');
-    el.className   = 'kf-entry';
-    el.textContent = text;
+  addKillFeed(text){
+    const feed=document.getElementById('killFeed');
+    const el=document.createElement('div');el.className='kf-entry';el.textContent=text;
     feed.appendChild(el);
-    setTimeout(() => { if (el.parentNode) el.parentNode.removeChild(el); }, 3200);
-    // Keep feed max 5 entries
-    while (feed.children.length > 5) feed.removeChild(feed.firstChild);
+    setTimeout(()=>{if(el.parentNode) el.parentNode.removeChild(el);},3100);
+    while(feed.children.length>6) feed.removeChild(feed.firstChild);
   },
 
-  toggleBuildBanner(show) {
-    const el = document.getElementById('buildBanner');
-    if (show) el.classList.remove('hidden');
-    else      el.classList.add('hidden');
-    this.updateBuildType(State.buildType);
+  toggleBuildHUD(show){
+    const e=document.getElementById('buildHUD');
+    show?e.classList.remove('hidden'):e.classList.add('hidden');
+    document.querySelectorAll('.bslot').forEach(s=>s.classList.toggle('active',s.dataset.type===State.buildType));
   },
 
-  updateBuildType(type) {
-    document.querySelectorAll('.btype').forEach(el => {
-      el.classList.toggle('active', el.dataset.type === type);
-    });
+  showReloadBar(show){
+    const e=document.getElementById('reloadBar');
+    show?e.classList.remove('hidden'):e.classList.add('hidden');
   },
 
-  showReloadBar(show) {
-    const el = document.getElementById('reloadBar');
-    if (show) el.classList.remove('hidden');
-    else      el.classList.add('hidden');
-    if (!show) this.setReloadProgress(0);
+  setReloadProgress(pct){document.getElementById('reloadFill').style.width=(pct*100)+'%';},
+
+  setNetStatus(online){
+    const e=document.getElementById('netStatus');
+    e.className=online?'net-online':'net-offline';
+    e.textContent=online?`ONLINE — ${Object.keys(State.players).length+1}p`:'OFFLINE';
   },
 
-  setReloadProgress(pct) {
-    document.getElementById('reloadFill').style.width = (pct * 100) + '%';
-  },
-
-  setNetStatus(online) {
-    const el = document.getElementById('netStatus');
-    el.className   = online ? 'net-online' : 'net-offline';
-    el.textContent = online ? `● ONLINE — ${Object.keys(State.players).length + 1} players` : '● OFFLINE';
-  },
-
-  renderPlayerList() {
-    const ul = document.getElementById('plList');
-    ul.innerHTML = '';
-    const mkLi = (name, isLocal) => {
-      const li = document.createElement('li');
-      li.innerHTML = `<span>${isLocal ? '▶ ' : ''}${name}</span><span style="color:var(--accent)">0</span>`;
-      ul.appendChild(li);
-    };
-    mkLi(State.playerName, true);
-    for (const id in State.players) mkLi(State.players[id].name, false);
+  renderPlayerList(){
+    const ul=document.getElementById('plList');ul.innerHTML='';
+    const mk=(name,local)=>{const li=document.createElement('li');li.innerHTML=`<span>${local?'▶ ':''}${name}</span>`;ul.appendChild(li);};
+    mk(State.playerName,true);
+    for(const id in State.players) mk(State.players[id].name,false);
     this.setNetStatus(NetworkManager.connected);
   },
 
-  togglePlayerList(show) {
-    const el = document.getElementById('playerList');
-    if (show) el.classList.remove('hidden');
-    else      el.classList.add('hidden');
+  togglePlayerList(show){const e=document.getElementById('playerList');show?e.classList.remove('hidden'):e.classList.add('hidden');},
+
+  showPracticeHUD(show){
+    const e=document.getElementById('practiceHUD');
+    show?e.classList.remove('hidden'):e.classList.add('hidden');
   },
 
-  showToast(msg, type = '') {
-    const container = document.getElementById('toastContainer');
-    const el        = document.createElement('div');
-    el.className    = `toast ${type}`;
-    el.textContent  = msg;
-    container.appendChild(el);
-    setTimeout(() => { if (el.parentNode) el.parentNode.removeChild(el); }, 3200);
+  updatePracticeHUD(){
+    document.getElementById('pracHits').textContent=State.practiceHits;
+    document.getElementById('pracShots').textContent=State.practiceShots;
+    const acc=State.practiceShots>0?Math.round(State.practiceHits/State.practiceShots*100):0;
+    document.getElementById('pracAcc').textContent=acc+'%';
+    const secs=Math.round((Date.now()-State.practiceStart)/1000);
+    document.getElementById('pracTimer').textContent=secs+'s';
   },
 
-  setLoadProgress(pct, status) {
-    document.getElementById('loadBar').style.width  = pct + '%';
-    document.getElementById('loadStatus').textContent = status;
+  showToast(msg,type=''){
+    const c=document.getElementById('toastContainer');
+    const el=document.createElement('div');el.className=`toast ${type}`;el.textContent=msg;
+    c.appendChild(el);
+    setTimeout(()=>{if(el.parentNode) el.parentNode.removeChild(el);},3100);
   },
 
-  hideLoadingScreen() {
-    const el = document.getElementById('loadingScreen');
-    el.style.transition = 'opacity 0.5s';
-    el.style.opacity    = '0';
-    setTimeout(() => el.style.display = 'none', 500);
+  setLoadProgress(pct,status){
+    document.getElementById('loadBar').style.width=pct+'%';
+    document.getElementById('loadStatus').textContent=status;
+  },
+
+  hideLoadingScreen(){
+    const el=document.getElementById('loadingScreen');
+    el.style.transition='opacity .5s';el.style.opacity='0';
+    setTimeout(()=>el.style.display='none',520);
   },
 };
 
-/* ═══════════════════════════════════════════════════════════
-   SECTION 13 — GAME ORCHESTRATOR
-   ═══════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════
+   GAME
+═══════════════════════════════════════ */
 const Game = {
-  scene:      null,
-  camera:     null,
-  renderer:   null,
-  clock:      null,
-  groundMesh: null,
-  _raf:       null,
+  scene:null,camera:null,renderer:null,clock:null,groundMesh:null,_raf:null,
 
-  async init() {
+  async init(){
     StorageManager.load();
 
-    // ── Renderer ──
-    this.renderer = new THREE.WebGLRenderer({
-      canvas:    document.getElementById('gameCanvas'),
-      antialias: true,
-      powerPreference: 'high-performance',
-    });
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    this.renderer.setSize(window.innerWidth, window.innerHeight);
-    this.renderer.shadowMap.enabled = true;
-    this.renderer.shadowMap.type    = THREE.PCFSoftShadowMap;
+    this.renderer=new THREE.WebGLRenderer({canvas:document.getElementById('gameCanvas'),antialias:true,powerPreference:'high-performance'});
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio,2));
+    this.renderer.setSize(window.innerWidth,window.innerHeight);
+    this.renderer.shadowMap.enabled=true;
+    this.renderer.shadowMap.type=THREE.PCFSoftShadowMap;
 
-    window.addEventListener('resize', () => {
-      this.renderer.setSize(window.innerWidth, window.innerHeight);
-      this.camera.aspect = window.innerWidth / window.innerHeight;
+    window.addEventListener('resize',()=>{
+      this.renderer.setSize(window.innerWidth,window.innerHeight);
+      this.camera.aspect=window.innerWidth/window.innerHeight;
       this.camera.updateProjectionMatrix();
     });
 
-    UIManager.setLoadProgress(10, 'Setting up scene...');
-    await this._delay(80);
+    UIManager.setLoadProgress(10,'Scene setup...');
+    await this._delay(60);
 
-    // ── Scene ──
-    this.scene  = new THREE.Scene();
-    this.scene.background = new THREE.Color(0x87ceeb);
-    this.scene.fog = new THREE.FogExp2(0x87ceeb, 0.012);
+    this.scene=new THREE.Scene();
+    this.scene.background=new THREE.Color(0x87ceeb);
+    this.scene.fog=new THREE.FogExp2(0x87ceeb,0.011);
+    this.camera=new THREE.PerspectiveCamera(CONFIG.FOV,window.innerWidth/window.innerHeight,0.1,600);
+    this.clock=new THREE.Clock();
 
-    // ── Camera ──
-    this.camera = new THREE.PerspectiveCamera(
-      CONFIG.FOV,
-      window.innerWidth / window.innerHeight,
-      0.1,
-      500
-    );
-    this.clock = new THREE.Clock();
+    UIManager.setLoadProgress(28,'Physics...');
+    await this._delay(60);
+    try{PhysicsManager.init();}catch(e){console.error('[PhysicsMgr]',e);}
 
-    UIManager.setLoadProgress(25, 'Loading lighting...');
-    await this._delay(80);
-    this._setupLighting();
+    UIManager.setLoadProgress(50,'World...');
+    await this._delay(60);
+    try{this._setupLighting();this._setupWorld();}catch(e){console.error('[World]',e);}
 
-    // ── Physics MUST init before _setupWorld (world.addBody calls inside) ──
-    UIManager.setLoadProgress(40, 'Initializing physics...');
-    await this._delay(80);
-    try { PhysicsManager.init(); }
-    catch(e) { console.error('[Game] PhysicsManager.init failed:', e); }
-
-    UIManager.setLoadProgress(55, 'Building world...');
-    await this._delay(80);
-    try { this._setupWorld(); }
-    catch(e) { console.error('[Game] _setupWorld failed:', e); }
-
-    UIManager.setLoadProgress(72, 'Loading systems...');
-    await this._delay(80);
-    try {
+    UIManager.setLoadProgress(70,'Systems...');
+    await this._delay(60);
+    try{
       BuildingSystem.init(this.scene);
       CombatSystem.init();
       Input.init();
-    } catch(e) { console.error('[Game] Systems init failed:', e); }
+    }catch(e){console.error('[Systems]',e);}
 
-    UIManager.setLoadProgress(90, 'Preparing UI...');
-    await this._delay(80);
-    try {
+    UIManager.setLoadProgress(88,'UI...');
+    await this._delay(60);
+    try{
       UIManager.init();
+      SettingsSystem.init();
+      SkinsSystem.init();
       AdminSystem.init();
       ReportSystem.init();
-    } catch(e) { console.error('[Game] UI init failed:', e); }
+    }catch(e){console.error('[UI]',e);}
 
-    UIManager.setLoadProgress(100, 'Ready!');
-    await this._delay(500);
+    UIManager.setLoadProgress(100,'Ready!');
+    await this._delay(450);
     UIManager.hideLoadingScreen();
-
-    State.phase = 'menu';
+    State.phase='menu';
     UIManager.showScreen('mainMenu');
-
-    // Start the render loop (runs even on menu for background render)
     this._loop();
   },
 
-  _setupLighting() {
-    // Ambient
-    const ambient = new THREE.AmbientLight(0xffffff, 0.5);
-    this.scene.add(ambient);
-
-    // Sun (directional with shadows)
-    const sun = new THREE.DirectionalLight(0xfff5dd, 1.2);
-    sun.position.set(80, 120, 60);
-    sun.castShadow = true;
-    sun.shadow.mapSize.width  = 2048;
-    sun.shadow.mapSize.height = 2048;
-    sun.shadow.camera.near   =  0.5;
-    sun.shadow.camera.far    = 500;
-    sun.shadow.camera.left   = -80;
-    sun.shadow.camera.right  =  80;
-    sun.shadow.camera.top    =  80;
-    sun.shadow.camera.bottom = -80;
+  _setupLighting(){
+    this.scene.add(new THREE.AmbientLight(0xffffff,0.55));
+    const sun=new THREE.DirectionalLight(0xfff4dd,1.1);
+    sun.position.set(80,120,60);sun.castShadow=true;
+    sun.shadow.mapSize.width=sun.shadow.mapSize.height=2048;
+    sun.shadow.camera.near=0.5;sun.shadow.camera.far=500;
+    sun.shadow.camera.left=-100;sun.shadow.camera.right=100;
+    sun.shadow.camera.top=100;sun.shadow.camera.bottom=-100;
     this.scene.add(sun);
-
-    // Hemisphere fill
-    const hemi = new THREE.HemisphereLight(0x87ceeb, 0x3d5c2b, 0.4);
-    this.scene.add(hemi);
+    this.scene.add(new THREE.HemisphereLight(0x87ceeb,0x3d5c2b,0.38));
   },
 
-  _setupWorld() {
-    // Ground plane
-    const groundGeo  = new THREE.PlaneGeometry(CONFIG.GROUND_SIZE, CONFIG.GROUND_SIZE, 32, 32);
-    const groundMat  = new THREE.MeshLambertMaterial({ color: 0x4a7c3b });
-    this.groundMesh  = new THREE.Mesh(groundGeo, groundMat);
-    this.groundMesh.rotation.x    = -Math.PI / 2;
-    this.groundMesh.receiveShadow = true;
+  _setupWorld(){
+    // Ground
+    const groundGeo=new THREE.PlaneGeometry(CONFIG.GROUND_SIZE,CONFIG.GROUND_SIZE,48,48);
+    const groundMat=new THREE.MeshLambertMaterial({color:0x4a7c3b});
+    this.groundMesh=new THREE.Mesh(groundGeo,groundMat);
+    this.groundMesh.rotation.x=-Math.PI/2;this.groundMesh.receiveShadow=true;
     this.scene.add(this.groundMesh);
+    const grid=new THREE.GridHelper(CONFIG.GROUND_SIZE,CONFIG.GROUND_SIZE/CONFIG.GRID_SIZE,0x2a5c2a,0x2a5c2a);
+    grid.position.y=0.01;this.scene.add(grid);
 
-    // Grid overlay
-    const gridHelper = new THREE.GridHelper(CONFIG.GROUND_SIZE, CONFIG.GROUND_SIZE / CONFIG.GRID_SIZE, 0x2a5c2a, 0x2a5c2a);
-    gridHelper.position.y = 0.01;
-    this.scene.add(gridHelper);
-
-    // Decorative: a few static boxes (terrain variation)
-    const boxPositions = [
-      [-20, 1, -15], [18, 1.5, -30], [-35, 1, 25], [30, 1, 20],
-    ];
-    boxPositions.forEach(([x, y, z]) => {
-      const w = 3 + Math.random() * 6;
-      const h = 2 + Math.random() * 4;
-      const d = 3 + Math.random() * 6;
-      const geo  = new THREE.BoxGeometry(w, h, d);
-      const mat  = new THREE.MeshLambertMaterial({ color: 0x8a7a6a });
-      const mesh = new THREE.Mesh(geo, mat);
-      mesh.position.set(x, h/2, z);
-      mesh.castShadow    = true;
-      mesh.receiveShadow = true;
-      this.scene.add(mesh);
-
-      // Physics for terrain boxes
-      PhysicsManager.createBoxBody({
-        w, h, d,
-        mass:     0,
-        material: PhysicsManager.buildMat,
-        position: { x, y: h/2, z },
-      });
+    // Terrain boxes (decorative obstacles)
+    [[-20,3,-20],[18,4,-32],[-35,2,28],[30,3,22],[0,2,-45],[42,2,-10]].forEach(([x,h,z])=>{
+      const w=4+Math.random()*8,d=4+Math.random()*8;
+      const m=new THREE.Mesh(new THREE.BoxGeometry(w,h,d),new THREE.MeshLambertMaterial({color:0x7a6a5a}));
+      m.position.set(x,h/2,z);m.castShadow=true;m.receiveShadow=true;
+      this.scene.add(m);
+      try{PhysicsManager.createBoxBody(w,h,d,0,{x,y:h/2,z},PhysicsManager.buildMat);}catch(e){}
     });
   },
 
-  async startGame(connectToServer = false) {
-    UIManager.hideScreen('mainMenu');
-    UIManager.hideScreen('controlsScreen');
+  async startGame(connectToServer,isPractice){
+    UIManager.hideScreen('mainMenu');UIManager.hideScreen('controlsScreen');
+    State.isPractice=isPractice||false;
+    State.kills=0;State.shots=0;State.hits=0;
+    State.health=CONFIG.MAX_HEALTH;State.ammo=CONFIG.MAX_AMMO;State.reserveAmmo=CONFIG.RESERVE_AMMO;
 
-    // Setup player
-    PlayerController.init(this.scene);
+    try{PlayerController.init(this.scene);}catch(e){console.error('[PlayerCtrl]',e);}
 
-    // Networking
-    if (connectToServer) {
-      NetworkManager.init();
-    }
+    if(connectToServer) NetworkManager.init();
 
     UIManager.showHUD(true);
-    State.phase  = 'playing';
-    State.health = CONFIG.MAX_HEALTH;
-    State.ammo   = CONFIG.MAX_AMMO;
-    State.kills  = 0;
-    UIManager.updateHealth();
-    UIManager.updateAmmo();
-    UIManager.updateKills();
-    UIManager.renderPlayerList();
+    UIManager.updateHealth();UIManager.updateAmmo();UIManager.updateKills();UIManager.renderPlayerList();
 
-    // Request pointer lock
-    setTimeout(() => Input.requestPointerLock(), 300);
+    if(isPractice){
+      State.phase='practice';
+      // Spawn at range start position
+      PlayerController.body.position.set(0,2,5);
+      try{PracticeRange.build(this.scene);}catch(e){console.error('[PracticeRange]',e);}
+    } else {
+      State.phase='playing';
+    }
+
+    setTimeout(()=>Input.requestLock(),300);
   },
 
-  returnToMenu() {
-    State.phase = 'menu';
-    Input.releasePointerLock();
+  returnToMenu(){
+    const prevPhase=State.phase;
+    State.phase='menu';
+    Input.releaseLock();
     UIManager.showHUD(false);
-    UIManager.hideScreen('pauseMenu');
-    UIManager.hideScreen('deathScreen');
-    UIManager.showScreen('mainMenu');
+    UIManager.hideScreen('pauseMenu');UIManager.hideScreen('deathScreen');
+    UIManager.toggleBuildHUD(false);State.buildMode=false;
 
-    // Remove player from scene
-    if (PlayerController.mesh && PlayerController.mesh.parent) {
-      this.scene.remove(PlayerController.mesh);
+    if(State.isPractice) try{PracticeRange.cleanup(this.scene);}catch(_){}
+
+    if(PlayerController.mesh&&PlayerController.mesh.parent) this.scene.remove(PlayerController.mesh);
+    if(PlayerController.body) try{PhysicsManager.world.remove(PlayerController.body);}catch(_){}
+    PlayerController.body=null;PlayerController.mesh=null;
+
+    for(const id in State.players){
+      const p=State.players[id];if(p.mesh&&p.mesh.parent) this.scene.remove(p.mesh);
     }
-    if (PlayerController.body) {
-      PhysicsManager.world.remove(PlayerController.body);
-    }
+    State.players={};
+    BuildingSystem.clearAll();
 
-    // Clear remote players
-    for (const id in State.players) {
-      const p = State.players[id];
-      if (p.mesh && p.mesh.parent) this.scene.remove(p.mesh);
-    }
-    State.players = {};
-
-    // Clear structures
-    BuildingSystem.placements.forEach(({ mesh, body }) => {
-      this.scene.remove(mesh);
-      PhysicsManager.world.remove(body);
-    });
-    BuildingSystem.placements = [];
-    State.structures = [];
-
-    // Disconnect network
-    if (NetworkManager.socket) NetworkManager.socket.disconnect();
-    NetworkManager.connected = false;
+    if(NetworkManager.socket) try{NetworkManager.socket.disconnect();}catch(_){}
+    NetworkManager.connected=false;
     UIManager.setNetStatus(false);
+
+    UIManager.showScreen('mainMenu');
   },
 
-  _loop() {
-    this._raf = requestAnimationFrame(() => this._loop());
-    const dt  = Math.min(this.clock.getDelta(), 0.05);
-    const now = Date.now();
+  _loop(){
+    this._raf=requestAnimationFrame(()=>this._loop());
+    const dt=Math.min(this.clock.getDelta(),0.05);
+    const now=Date.now();
 
-    if (State.phase === 'playing') {
-      PhysicsManager.step(dt);
-      PlayerController.update(dt);
-      BuildingSystem.update();
-      CombatSystem.update();
+    if(State.phase==='playing'||State.phase==='practice'){
+      try{PhysicsManager.step(dt);}catch(_){}
+      try{PlayerController.update(dt);}catch(_){}
+      try{BuildingSystem.update();}catch(_){}
+      try{CombatSystem.update();}catch(_){}
+      if(State.phase==='practice') try{PracticeRange.update(now);}catch(_){}
       NetworkManager.tick(now);
+
+      // Animate reload bar
+      if(CombatSystem.reloading){
+        const prog=(Date.now()-CombatSystem._reloadStart)/CONFIG.RELOAD_TIME;
+        UIManager.setReloadProgress(Math.min(prog,1));
+      }
     }
 
-    this.renderer.render(this.scene, this.camera);
+    this.renderer.render(this.scene,this.camera);
   },
 
-  _delay(ms) { return new Promise(r => setTimeout(r, ms)); },
+  _delay(ms){return new Promise(r=>setTimeout(r,ms));}
 };
 
-/* ═══════════════════════════════════════════════════════════
-   ENTRY POINT
-   ═══════════════════════════════════════════════════════════ */
-window.addEventListener('load', () => Game.init());
+window.addEventListener('load',()=>Game.init().catch(e=>console.error('[Game.init]',e)));
