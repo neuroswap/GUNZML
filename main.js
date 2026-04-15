@@ -1,72 +1,114 @@
-let scene = new THREE.Scene();
-let camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.1, 1000);
-let renderer = new THREE.WebGLRenderer();
-renderer.setSize(window.innerWidth, window.innerHeight);
-document.body.appendChild(renderer.domElement);
+// =====================
+// BASIC SETUP
+// =====================
 
-camera.position.z = 5;
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0a0d12);
 
-// players
-let players = {};
-let myId = null;
+const camera = new THREE.PerspectiveCamera(
+  75,
+  window.innerWidth / window.innerHeight,
+  0.1,
+  1000
+);
 
-// connect to server
-const socket = new WebSocket("ws://localhost:3000");
-
-socket.onmessage = (event) => {
-    const data = JSON.parse(event.data);
-
-    if (data.type === "init") {
-        myId = data.id;
-        players = data.players;
-
-        for (let id in players) {
-            createPlayer(id);
-        }
-    }
-
-    if (data.type === "update") {
-        players = data.players;
-
-        for (let id in players) {
-            if (!scene.getObjectByName(id)) {
-                createPlayer(id);
-            }
-
-            let p = scene.getObjectByName(id);
-            if (p) {
-                p.position.set(players[id].x, players[id].y, players[id].z);
-            }
-        }
-    }
-};
-
-// player mesh
-function createPlayer(id) {
-    let geo = new THREE.BoxGeometry();
-    let mat = new THREE.MeshBasicMaterial({ color: 0x00aaff });
-    let cube = new THREE.Mesh(geo, mat);
-    cube.name = id;
-    scene.add(cube);
-}
-
-// movement
-document.addEventListener("keydown", (e) => {
-    if (!players[myId]) return;
-
-    if (e.key === "w") players[myId].z -= 0.2;
-    if (e.key === "s") players[myId].z += 0.2;
-    if (e.key === "a") players[myId].x -= 0.2;
-    if (e.key === "d") players[myId].x += 0.2;
-
-    socket.send(JSON.stringify({
-        type: "move",
-        position: players[myId]
-    }));
+const renderer = new THREE.WebGLRenderer({
+  canvas: document.getElementById("gameCanvas")
 });
 
-function animate() {
-    requestAnimationFrame(animate);
-    renderer.render(scene, camera);
+renderer.setSize(window.innerWidth, window.innerHeight);
+
+// =====================
+// LIGHT
+// =====================
+const light = new THREE.DirectionalLight(0xffffff, 1);
+light.position.set(5, 10, 5);
+scene.add(light);
+
+// =====================
+// FLOOR
+// =====================
+const floorGeo = new THREE.PlaneGeometry(100, 100);
+const floorMat = new THREE.MeshStandardMaterial({ color: 0x222222 });
+const floor = new THREE.Mesh(floorGeo, floorMat);
+floor.rotation.x = -Math.PI / 2;
+scene.add(floor);
+
+// =====================
+// PLAYER (YOU)
+// =====================
+const player = new THREE.Mesh(
+  new THREE.BoxGeometry(1, 2, 1),
+  new THREE.MeshStandardMaterial({ color: 0x00aaff })
+);
+player.position.y = 1;
+scene.add(player);
+
+// camera offset
+camera.position.set(0, 2, 5);
+
+// =====================
+// MOVEMENT
+// =====================
+const keys = {};
+
+document.addEventListener("keydown", (e) => keys[e.key.toLowerCase()] = true);
+document.addEventListener("keyup", (e) => keys[e.key.toLowerCase()] = false);
+
+// =====================
+// SHOOTING
+// =====================
+const raycaster = new THREE.Raycaster();
+
+document.addEventListener("click", () => {
+  raycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
+
+  const hits = raycaster.intersectObjects(scene.children);
+  if (hits.length > 0) {
+    hits[0].object.material.color.set(0xff0000);
+  }
+});
+
+// =====================
+// BUILD SYSTEM (TEST WALL)
+// =====================
+function buildWall() {
+  const wall = new THREE.Mesh(
+    new THREE.BoxGeometry(2, 2, 0.5),
+    new THREE.MeshStandardMaterial({ color: 0x5555ff })
+  );
+
+  wall.position.set(
+    player.position.x,
+    1,
+    player.position.z - 5
+  );
+
+  scene.add(wall);
 }
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "q") buildWall();
+});
+
+// =====================
+// GAME LOOP
+// =====================
+function animate() {
+  requestAnimationFrame(animate);
+
+  // movement
+  if (keys["w"]) player.position.z -= 0.1;
+  if (keys["s"]) player.position.z += 0.1;
+  if (keys["a"]) player.position.x -= 0.1;
+  if (keys["d"]) player.position.x += 0.1;
+
+  // camera follows player
+  camera.position.x = player.position.x;
+  camera.position.z = player.position.z + 5;
+  camera.lookAt(player.position);
+
+  renderer.render(scene, camera);
+}
+
 animate();
